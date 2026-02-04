@@ -1,0 +1,31 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+
+# Debug / temp files
+output/debug*
+output/temp_*
+output/test_*
+output/s1.py
+output/s4a.py
+output/s4p3.txt
+output/boot.py
+output/bootstrap.py
+output/run4.py
+output/run4b.py
+output/process_*.py
+output/search_*.py
+output/write_*.py
+output/transform_*.py
+output/gen_*.py
+
+# Backup files
+output/*_backup_*
+
+# Intermediate research batches
+output/li_research_batch*.json
+output/li_result_batch*.json
+
+# Claude internal
+.claude/settings.local.json
