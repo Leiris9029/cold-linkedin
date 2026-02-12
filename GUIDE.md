@@ -34,7 +34,7 @@
 ### 최초 설정 (1회만)
 
 ```
-1. VS Code에서 이 폴더(JAPAN)를 엽니다
+1. VS Code에서 이 폴더(Cold)를 엽니다
 2. Claude Code를 실행합니다
 3. 끝. 별도 설치나 설정 없이 바로 사용 가능합니다.
 ```
@@ -46,7 +46,7 @@
 ## 2. 프로젝트 구조
 
 ```
-JAPAN/
+Cold/
 ├── .claude/skills/
 │   ├── coldmail/SKILL.md    ← 콜드메일 생성 (설득 프레임워크 + 업종별 차별화)
 │   ├── review/SKILL.md     ← 메일 검수 (팩트체크 + 수치 감사 + 문법)
@@ -675,7 +675,7 @@ CSV에 our_solution이 비어있는 행에는 이 정보를 적용해줘.
 ## 15. FAQ / 트러블슈팅
 
 ### Q: 스킬이 인식되지 않아요
-**A:** 이 프로젝트 폴더(JAPAN)를 VS Code에서 열었는지 확인하세요. `.claude/skills/` 폴더가 있는 디렉토리에서 Claude Code를 실행해야 합니다.
+**A:** 이 프로젝트 폴더(Cold)를 VS Code에서 열었는지 확인하세요. `.claude/skills/` 폴더가 있는 디렉토리에서 Claude Code를 실행해야 합니다.
 
 ### Q: CSV 파일이 깨져요
 **A:** CSV 파일을 UTF-8 인코딩으로 저장하세요. 엑셀에서 저장할 때 "CSV UTF-8 (쉼표로 분리)" 형식을 선택합니다.

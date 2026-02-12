@@ -4,18 +4,24 @@ Google Sheets client - uploads CSV data to Google Sheets for GMass integration.
 GMass reads recipient lists from Google Sheets, so we upload our CSV there
 and then point GMass at the sheet.
 
+Strategy: Use a single pre-shared spreadsheet ("ColdMail Campaign") owned by
+the user's personal Google account. The service account has editor access.
+Each campaign gets its own worksheet tab within that spreadsheet.
+
 Requires: Google Service Account with Sheets API enabled.
 """
 import csv
-import io
 import gspread
 from google.oauth2.service_account import Credentials
-from config import GOOGLE_SERVICE_ACCOUNT_JSON, GMASS_FROM_EMAIL
+from config import GOOGLE_SERVICE_ACCOUNT_JSON, GMASS_FROM_EMAIL, GOOGLE_SPREADSHEET_ID
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
+# The shared spreadsheet name (must already exist and be shared with the service account)
+DEFAULT_SPREADSHEET_NAME = "ColdMail Campaign"
 
 
 class SheetsClient:
@@ -26,11 +32,11 @@ class SheetsClient:
     def upload_csv(
         self,
         csv_path: str,
-        spreadsheet_name: str = "ColdMail Campaign",
+        spreadsheet_name: str = DEFAULT_SPREADSHEET_NAME,
         worksheet_name: str = "Sheet1",
     ) -> tuple[str, str]:
         """
-        Upload a CSV file to Google Sheets.
+        Upload a CSV file to a worksheet in the shared Google Spreadsheet.
 
         Returns:
             (spreadsheet_id, worksheet_id) for GMass list creation.
@@ -43,14 +49,11 @@ class SheetsClient:
         if not rows:
             raise ValueError(f"CSV is empty: {csv_path}")
 
-        # Create or open spreadsheet
-        try:
+        # Open existing shared spreadsheet by ID (avoids name collision)
+        if GOOGLE_SPREADSHEET_ID:
+            spreadsheet = self.gc.open_by_key(GOOGLE_SPREADSHEET_ID)
+        else:
             spreadsheet = self.gc.open(spreadsheet_name)
-        except gspread.SpreadsheetNotFound:
-            spreadsheet = self.gc.create(spreadsheet_name)
-            # Share with the GMass account email so GMass can access it
-            if GMASS_FROM_EMAIL:
-                spreadsheet.share(GMASS_FROM_EMAIL, perm_type="user", role="writer")
 
         # Get or create worksheet
         try:
@@ -58,7 +61,7 @@ class SheetsClient:
             worksheet.clear()
         except gspread.WorksheetNotFound:
             worksheet = spreadsheet.add_worksheet(
-                title=worksheet_name, rows=len(rows), cols=len(rows[0])
+                title=worksheet_name, rows=max(len(rows), 100), cols=max(len(rows[0]), 10)
             )
 
         # Upload all rows
@@ -69,20 +72,24 @@ class SheetsClient:
     def upload_mailmerge_csv(
         self,
         csv_path: str,
-        campaign_name: str = "ColdMail Campaign",
+        campaign_name: str = "Campaign",
     ) -> tuple[str, str]:
         """
-        Upload the coldmails_mailmerge.csv specifically.
-        The CSV has columns: to_name, to_email, company, subject, body
+        Upload a mailmerge CSV as a new worksheet tab in the shared spreadsheet.
 
-        GMass uses column names to do mail merge:
-        - {to_name}, {company}, {subject}, {body} become merge fields.
-        - The 'to_email' column is used as the recipient address.
+        The worksheet name is the campaign_name (e.g., "ColdMail_260204").
+        GMass uses column names for mail merge:
+        - {subject}, {body} become merge fields.
+        - The 'email' column is used as the recipient address.
 
         Returns:
             (spreadsheet_id, worksheet_id)
         """
-        return self.upload_csv(csv_path, spreadsheet_name=campaign_name)
+        return self.upload_csv(
+            csv_path,
+            spreadsheet_name=DEFAULT_SPREADSHEET_NAME,
+            worksheet_name=campaign_name,
+        )
 
     def read_tracking_data(self, spreadsheet_id: str, worksheet_name: str = "Sheet1") -> list[dict]:
         """

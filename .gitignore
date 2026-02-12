@@ -27,5 +27,9 @@ output/*_backup_*
 output/li_research_batch*.json
 output/li_result_batch*.json
 
+# Google service account key
+data/*service_account*.json
+data/coldauto-*.json
+
 # Claude internal
 .claude/settings.local.json

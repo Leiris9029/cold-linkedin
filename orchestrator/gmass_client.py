@@ -63,14 +63,19 @@ class GMassClient:
         filter_criteria: Optional[str] = None,
     ) -> dict:
         """Create a GMass list from a Google Sheet."""
-        data = {
+        sheet_source = {
             "spreadsheetId": spreadsheet_id,
-            "worksheetId": worksheet_id,
+            "worksheetId": str(worksheet_id),
             "UpdateSheet": update_sheet,
             "KeepDuplicates": keep_duplicates,
         }
         if filter_criteria:
-            data["FilterCriteria"] = filter_criteria
+            sheet_source["FilterCriteria"] = filter_criteria
+        data = {
+            "listSource": {
+                "listSourceSheet": sheet_source,
+            }
+        }
         return self._post("/lists", data)
 
     def get_lists(self) -> dict:
@@ -137,17 +142,49 @@ class GMassClient:
 
     # ── Campaign Reports ─────────────────────────────────
 
-    def get_campaigns(self) -> dict:
+    def _extract_data(self, response: dict | list) -> list:
+        """Extract 'data' array from GMass report response ({metadata, data} structure)."""
+        if isinstance(response, dict) and "data" in response:
+            return response["data"]
+        if isinstance(response, list):
+            return response
+        return []
+
+    def get_campaigns(self) -> list:
         """Get all campaigns."""
         return self._get("/campaigns")
 
-    def get_campaign_report(self, campaign_id: str) -> dict:
-        """Get detailed report for a specific campaign (opens, clicks, replies, bounces)."""
-        return self._get(f"/campaigns/{campaign_id}/report")
+    def get_campaign(self, campaign_id: str) -> dict:
+        """Get a single campaign and its aggregate statistics."""
+        return self._get(f"/campaigns/{campaign_id}")
 
-    def get_campaign_recipients(self, campaign_id: str) -> dict:
+    def get_campaign_recipients(self, campaign_id: str) -> list:
         """Get recipient-level data for a campaign."""
-        return self._get(f"/campaigns/{campaign_id}/recipients")
+        return self._extract_data(self._get(f"/reports/{campaign_id}/recipients"))
+
+    def get_campaign_opens(self, campaign_id: str) -> list:
+        """Get recipients that opened a campaign."""
+        return self._extract_data(self._get(f"/reports/{campaign_id}/opens"))
+
+    def get_campaign_replies(self, campaign_id: str) -> list:
+        """Get recipients that replied to a campaign."""
+        return self._extract_data(self._get(f"/reports/{campaign_id}/replies"))
+
+    def get_campaign_bounces(self, campaign_id: str) -> list:
+        """Get recipients that bounced."""
+        return self._extract_data(self._get(f"/reports/{campaign_id}/bounces"))
+
+    def get_campaign_clicks(self, campaign_id: str) -> list:
+        """Get recipients that clicked a URL."""
+        return self._extract_data(self._get(f"/reports/{campaign_id}/clicks"))
+
+    def get_campaign_unsubscribes(self, campaign_id: str) -> list:
+        """Get recipients that unsubscribed."""
+        return self._extract_data(self._get(f"/reports/{campaign_id}/unsubscribes"))
+
+    def get_campaign_blocks(self, campaign_id: str) -> list:
+        """Get blocked recipients."""
+        return self._extract_data(self._get(f"/reports/{campaign_id}/blocks"))
 
     # ── Google Sheets ────────────────────────────────────
 
