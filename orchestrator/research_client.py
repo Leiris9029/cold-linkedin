@@ -482,3 +482,141 @@ class ResearchClient:
             progress_callback(total, total, "완료")
 
         return results
+
+    # ── Researcher Verification ──────────────────────────
+
+    def verify_researcher(self, name: str, institution: str = "",
+                          research_area: str = "", claimed_evidence: str = "") -> dict:
+        """Verify a researcher's actual activity against claimed evidence.
+
+        - Web search for researcher name + institution
+        - PubMed author search for publications
+        - ClinicalTrials.gov for PI involvement
+
+        Returns: {name, web_results, publications_found, pub_topics,
+                  trials_found, trial_titles, factual_summary, status}
+        status: "verified" | "partial" | "no_data"
+        """
+        # 1) Web search — researcher name + institution
+        query_parts = [f'"{name}"']
+        if institution:
+            query_parts.append(f'"{institution}"')
+        eng_kw = self._extract_english_keywords(claimed_evidence) if claimed_evidence else ""
+        if eng_kw:
+            query_parts.append(eng_kw)
+        else:
+            query_parts.append("professor researcher")
+        web_results = self._web_search(" ".join(query_parts), max_results=5)
+        web_snippets = [
+            {"title": r.get("title", ""), "snippet": r.get("body", "")[:200], "url": r.get("href", "")}
+            for r in web_results
+        ]
+
+        # 2) PubMed author search
+        pubmed_term_parts = [f'"{name}"[Author]']
+        if research_area:
+            pubmed_term_parts.append(f'({research_area})[tiab]')
+        pubmed_term = " AND ".join(pubmed_term_parts)
+        pmids = []
+        publications = []
+        pub_topics = []
+        try:
+            result = self._get(f"{self.PUBMED_BASE_URL}/esearch.fcgi", {
+                "db": "pubmed",
+                "term": pubmed_term,
+                "retmax": 10,
+                "retmode": "json",
+                "sort": "date",
+            })
+            time.sleep(0.4)
+            pmids = result.get("esearchresult", {}).get("idlist", [])
+            if pmids:
+                publications = self.fetch_pubmed_summaries(pmids)
+                pub_topics = [p.get("title", "")[:100] for p in publications[:5]]
+        except Exception as e:
+            logger.warning(f"PubMed author search failed for {name}: {e}")
+
+        # 3) ClinicalTrials.gov — search as PI/investigator
+        all_trials = []
+        try:
+            for status in ["RECRUITING", "ACTIVE_NOT_RECRUITING", "COMPLETED"]:
+                trials = self.search_trials(condition=research_area or None,
+                                            sponsor=institution or None,
+                                            status=status, page_size=5)
+                # Filter trials where this researcher appears as investigator
+                for t in trials:
+                    investigators = t.get("investigators", [])
+                    for inv in investigators:
+                        if name.lower() in inv.get("name", "").lower():
+                            all_trials.append(t)
+                            break
+                if len(all_trials) >= 5:
+                    break
+        except Exception as e:
+            logger.warning(f"ClinicalTrials search failed for {name}: {e}")
+
+        # Build factual summary
+        parts = []
+        if web_snippets:
+            desc = next((s["snippet"] for s in web_snippets if s["snippet"]), "")
+            if desc:
+                parts.append(f"웹: {desc[:150]}")
+        if publications:
+            parts.append(f"PubMed: {len(pmids)}건 (저자 검색)")
+        if all_trials:
+            parts.append(f"ClinicalTrials: PI로 {len(all_trials)}건 확인")
+
+        # Determine status
+        if publications or all_trials:
+            status = "verified"
+        elif web_snippets:
+            status = "partial"
+        else:
+            status = "no_data"
+
+        return {
+            "name": name,
+            "web_results": web_snippets,
+            "publications_found": len(pmids),
+            "pub_topics": pub_topics,
+            "trials_found": len(all_trials),
+            "trial_titles": [t["title"][:80] for t in all_trials[:5]],
+            "factual_summary": " | ".join(parts) if parts else "외부 데이터 없음",
+            "status": status,
+        }
+
+    def verify_researchers_batch(
+        self,
+        researchers: list[dict],
+        progress_callback=None,
+    ) -> list[dict]:
+        """Verify a batch of researchers from AI recommendations.
+
+        Args:
+            researchers: list of {name, institution, research_area, evidence, ...}
+            progress_callback: optional callable(current, total, researcher_name)
+
+        Returns: list of researcher dicts with verification data added
+        """
+        results = []
+        total = len(researchers)
+        for i, researcher in enumerate(researchers):
+            name = researcher.get("name", "")
+            if progress_callback:
+                progress_callback(i, total, name)
+
+            verification = self.verify_researcher(
+                name,
+                researcher.get("institution", ""),
+                researcher.get("research_area", ""),
+                researcher.get("evidence", ""),
+            )
+            results.append({
+                **researcher,
+                "verification": verification,
+            })
+
+        if progress_callback:
+            progress_callback(total, total, "완료")
+
+        return results

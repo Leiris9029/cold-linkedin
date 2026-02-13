@@ -249,6 +249,11 @@ def _render_company_card(company: dict, verification: dict | None, verdict: dict
         # AI's claimed evidence
         st.markdown(f"**AI 근거:** {company.get('evidence', reason)}")
 
+        # Tier classification reason
+        _tier_reason = company.get("tier_reason", "")
+        if _tier_reason:
+            st.markdown(f"**Tier 산정:** {_tier_reason}")
+
         # Cross-check verdict (the key new feature)
         if verdict and verdict.get("explanation"):
             v_status = verdict.get("verdict", "unverified")
@@ -296,6 +301,80 @@ def _render_company_card(company: dict, verification: dict | None, verdict: dict
 
                 if not web_results and not verification.get("is_pharma"):
                     st.warning("외부 소스에서 관련 데이터를 찾지 못했습니다.")
+
+
+def _render_researcher_card(researcher: dict, verdict: dict | None = None):
+    """Render a researcher card with institution and research details."""
+    name = researcher.get("name", "")
+    institution = researcher.get("institution", "")
+    dept = researcher.get("department", "")
+    title = researcher.get("title", "")
+    reason = researcher.get("reason", "")
+
+    # Status icon based on verdict
+    if verdict:
+        v_status = verdict.get("verdict", "unverified")
+        icon = {"confirmed": "+", "partial": "~", "unverified": "?", "wrong": "X"}.get(v_status, "?")
+        label = {"confirmed": "확인됨", "partial": "일부 확인", "unverified": "미검증", "wrong": "불일치"}.get(v_status, "?")
+    else:
+        icon = None
+
+    header_parts = [f"**{name}**"]
+    if title:
+        header_parts.append(title)
+    if institution:
+        sub = institution
+        if dept:
+            sub += f" ({dept})"
+        header_parts.append(sub)
+    header = " — ".join(header_parts)
+    if icon:
+        header += f"  [{icon} {label}]"
+    if reason:
+        header += f"  \n{reason}"
+
+    with st.expander(header, expanded=False):
+        # Cross-check verdict
+        if verdict and verdict.get("explanation"):
+            v_status = verdict.get("verdict", "unverified")
+            emoji = {"confirmed": "✅", "partial": "⚠️", "unverified": "❓", "wrong": "❌"}.get(v_status, "❓")
+            st.markdown(f"{emoji} **교차검증:** {verdict['explanation']}")
+
+        # Verification data summary
+        verification = researcher.get("verification", {})
+        if verification:
+            vparts = []
+            pubs_found = verification.get("publications_found", 0)
+            if pubs_found:
+                vparts.append(f"PubMed {pubs_found}건")
+            trials_found = verification.get("trials_found", 0)
+            if trials_found:
+                vparts.append(f"임상시험 PI {trials_found}건")
+            web_n = len(verification.get("web_results", []))
+            if web_n:
+                vparts.append(f"웹 결과 {web_n}건")
+            if vparts:
+                st.caption(f"외부 데이터: {' | '.join(vparts)}")
+
+        research_area = researcher.get("research_area", "")
+        if research_area:
+            st.markdown(f"**연구 분야:** {research_area}")
+
+        pubs = researcher.get("key_publications", "")
+        if pubs:
+            st.markdown(f"**주요 연구:** {pubs}")
+
+        evidence = researcher.get("evidence", "")
+        if evidence:
+            st.markdown(f"**추천 근거:** {evidence}")
+
+        tier_reason = researcher.get("tier_reason", "")
+        if tier_reason:
+            st.markdown(f"**Tier 산정:** {tier_reason}")
+
+        clues = researcher.get("contact_clues", "")
+        if clues:
+            st.markdown(f"**연락처 단서:** {clues}")
 
 
 def _auto_verify(result_text: str, feedback: str = ""):
@@ -375,6 +454,82 @@ def _auto_verify(result_text: str, feedback: str = ""):
         st.session_state.ai_target_verdicts = {}
 
 
+def _auto_verify_researchers(result_text: str, feedback: str = ""):
+    """Parse AI researcher result → external verification → Claude cross-check."""
+    import re as _re
+    json_match = _re.search(r"```json\s*\n(.*?)```", result_text, _re.DOTALL)
+    parsed = None
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group(1))
+        except json.JSONDecodeError:
+            pass
+    if not parsed:
+        try:
+            parsed = json.loads(result_text)
+        except json.JSONDecodeError:
+            pass
+
+    if parsed:
+        all_researchers = (parsed.get("tier1_researchers", [])
+                           + parsed.get("tier2_researchers", []))
+        if all_researchers:
+            n = len(all_researchers)
+            verify_bar = st.progress(0)
+            verify_status = st.empty()
+
+            # Step 2/3: External data collection
+            verify_status.info(f"⏱ 2/3 — 외부 데이터 수집 중 ({n}명 연구자: 웹 + PubMed + ClinicalTrials)...")
+            verify_bar.progress(0.1)
+            from research_client import ResearchClient
+            rc = ResearchClient()
+            verified_researchers = rc.verify_researchers_batch(all_researchers)
+            st.session_state.ai_researcher_verification = verified_researchers
+            verify_bar.progress(0.6)
+
+            # Step 3/3: Claude cross-check
+            verify_status.info("⏱ 3/3 — AI 근거 교차검증 중 (Claude 분석)...")
+            try:
+                from claude_client import ClaudeClient
+                claude = ClaudeClient()
+                cross_check_raw = claude.cross_check_researcher_evidence(
+                    verified_researchers, feedback=feedback
+                )
+                try:
+                    verdicts = json.loads(cross_check_raw)
+                except json.JSONDecodeError:
+                    raw = cross_check_raw.strip()
+                    if raw.startswith("["):
+                        last_brace = raw.rfind("}")
+                        if last_brace > 0:
+                            raw = raw[:last_brace + 1] + "]"
+                            verdicts = json.loads(raw)
+                            logger.info(f"Recovered {len(verdicts)} researcher verdicts from truncated JSON")
+                        else:
+                            raise
+                    else:
+                        raise
+                verdict_map = {v["researcher"]: v for v in verdicts if "researcher" in v}
+                st.session_state.ai_researcher_verdicts = verdict_map
+                verify_bar.progress(1.0)
+                n_done = len(verdict_map)
+                if n_done < n:
+                    verify_status.warning(f"⚠️ {n_done}/{n}명 연구자 검증 완료 (일부 잘림)")
+                else:
+                    verify_status.success(f"✅ {n}명 연구자 검증 완료!")
+            except Exception as e:
+                logger.warning(f"Researcher cross-check failed: {e}")
+                st.session_state.ai_researcher_verdicts = {}
+                verify_bar.progress(0.8)
+                verify_status.warning(f"교차검증 실패: {e}")
+        else:
+            st.session_state.ai_researcher_verification = None
+            st.session_state.ai_researcher_verdicts = {}
+    else:
+        st.session_state.ai_researcher_verification = None
+        st.session_state.ai_researcher_verdicts = {}
+
+
 # ── Initialize DB ────────────────────────────────────────
 db.init_db()
 
@@ -419,18 +574,9 @@ def parse_csv_string(csv_string: str) -> list[dict]:
 
 
 def load_products() -> dict[int, str]:
-    """Load product names from our_products.md."""
-    products = {}
-    products_path = DATA_DIR / "our_products.md"
-    if products_path.exists():
-        content = products_path.read_text(encoding="utf-8")
-        # Extract product names
-        for match in re.finditer(r"## 제품 (\d+)번\s*\n제품명:\s*(.+)", content):
-            num = int(match.group(1))
-            name = match.group(2).strip()
-            if name:
-                products[num] = name
-    return products
+    """Deprecated: product info now comes from campaign profile.
+    Kept for backward compatibility but returns empty dict."""
+    return {}
 
 
 def get_all_campaigns() -> list[dict]:
@@ -795,698 +941,1253 @@ if page == "⚙️ 캠페인 설정":
 
 elif page == "🎯 타겟 발굴":
     st.title("타겟 발굴")
-    st.caption("제품 설명을 입력하면 AI가 적합한 회사와 직종을 추천하고, 프리셋으로 저장합니다.")
 
-    if "ai_target_result" not in st.session_state:
-        st.session_state.ai_target_result = None
-    if "ai_target_verification" not in st.session_state:
-        st.session_state.ai_target_verification = None
-    if "ai_target_verdicts" not in st.session_state:
-        st.session_state.ai_target_verdicts = {}
-    if "agent_log" not in st.session_state:
-        st.session_state.agent_log = []
-    if "ai_target_parsed" not in st.session_state:
-        st.session_state.ai_target_parsed = None
-    if "_regen_preset" not in st.session_state:
-        st.session_state._regen_preset = None
-
-    # ── Input Section ─────────────────────────────
-    st.subheader("제품/서비스 정보")
-
-    ai_product_desc = st.text_area(
-        "제품/서비스 설명 (필수)",
-        height=150,
-        placeholder="예: Dataset과 연구 목적을 프롬프트로 넣으면 임상시험 시뮬레이션과 바이오마커 발굴 리포트를 생성하는 AI co-scientist",
-        key="ai_product_desc",
+    target_mode = st.radio(
+        "타겟 유형", ["company", "researcher"],
+        format_func={"company": "🏢 회사 타겟", "researcher": "🎓 연구자 타겟"}.__getitem__,
+        horizontal=True, key="target_mode", label_visibility="collapsed",
     )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        ai_target_hint = st.text_input(
-            "희망 대상/관련 직종 (자유 입력, 선택)",
-            placeholder="예: 바이오텍 R&D 담당자, CNS 연구 관련",
-            key="ai_target_hint",
-        )
-    with col2:
-        ai_region = st.text_input(
-            "지역 제한 (선택)",
-            placeholder="예: Japan, US, Europe 등 (비워두면 전체)",
-            key="ai_target_region",
-        )
+    if target_mode == "company":
+        st.caption("제품 설명을 입력하면 AI가 적합한 회사와 직종을 추천하고, 프리셋으로 저장합니다.")
 
-    # Collect companies for exclusion option (from presets + current results)
-    _existing_presets = db.get_presets()
-    _preset_companies = set()
-    for p in _existing_presets:
-        for c in (p.get("companies") or "").split(","):
-            c = c.strip()
-            if c:
-                _preset_companies.add(c)
-
-    _current_companies = set()
-    if st.session_state.ai_target_parsed:
-        for c in st.session_state.ai_target_parsed.get("tier1_companies", []):
-            _current_companies.add(c.get("name", ""))
-        for c in st.session_state.ai_target_parsed.get("tier2_companies", []):
-            _current_companies.add(c.get("name", ""))
-        _current_companies.discard("")
-
-    _all_excludable = _preset_companies | _current_companies
-
-    exclude_companies_set = set()
-    if _all_excludable:
-        ecol1, ecol2 = st.columns(2)
-        with ecol1:
-            if _preset_companies:
-                if st.checkbox(
-                    f"프리셋 회사 제외 ({len(_preset_companies)}개)",
-                    help=f"저장된 프리셋: {', '.join(list(_preset_companies)[:8])}{'...' if len(_preset_companies) > 8 else ''}",
-                ):
-                    exclude_companies_set |= _preset_companies
-        with ecol2:
-            if _current_companies:
-                if st.checkbox(
-                    f"현재 결과 회사 제외 ({len(_current_companies)}개)",
-                    help="현재 화면에 표시된 회사를 제외하고 새로운 회사만 추천",
-                ):
-                    exclude_companies_set |= _current_companies
-
-    if st.button("🤖 AI 타겟 추천 실행", type="primary", disabled=not ai_product_desc or st.session_state.get("agent_running")):
-        # Combine product desc with hint
-        full_desc = ai_product_desc
-        if ai_target_hint:
-            full_desc += f"\n\n희망 대상/관련 직종: {ai_target_hint}"
-
-        # Build exclusion list
-        exclude_companies = sorted(exclude_companies_set)
-        exclude_section = ""
-        if exclude_companies:
-            exclude_section = (
-                f"\n\n제외 대상 회사 (절대 추천하지 말 것): "
-                f"{', '.join(exclude_companies[:30])}"
-            )
-
-        region_line = f"\n지역 제한: {ai_region}" if ai_region else ""
-
-        _ctx = build_campaign_context(st.session_state.get("active_profile"))
-        _ctx_section = f"\n\n{_ctx}" if _ctx else ""
-        agent_request = (
-            f"아래 제품에 대해 타겟 회사를 찾아줘.\n\n"
-            f"## 제품 설명\n{full_desc}"
-            f"{region_line}{exclude_section}{_ctx_section}\n\n"
-            f"다양한 검색어로 웹 리서치를 수행한 뒤, "
-            f"결과를 Tier 1/Tier 2로 분류하고 save_results로 저장해줘."
-        )
-
-        # Phase 1: save params and rerun to show overlay
-        _run_profile_id = st.session_state.get("active_profile_id")
-        st.session_state._pending_agent1 = {
-            "request": agent_request,
-            "feedback": db.get_combined_feedback_text(_run_profile_id),
-        }
-        st.session_state.agent_running = True
-        st.rerun()
-
-    # Phase 2: execute pending Agent 1 task (overlay is already visible)
-    if st.session_state.get("_pending_agent1"):
-        _task = st.session_state.pop("_pending_agent1")
-        try:
-            from agent import CompanyListingAgent
-
-            tracker = AgentProgressTracker("agent1")
-
-            agent = CompanyListingAgent(
-                extra_feedback=_task["feedback"],
-                on_tool_call=tracker.on_tool_call,
-                on_tool_result=tracker.on_tool_result,
-                on_text=tracker.on_text,
-            )
-
-            agent_output = agent.run(_task["request"])
-
-            st.session_state.agent_log = tracker.tool_log
-
-            # Use saved JSON result if available, otherwise try parsing agent output
-            result_json = agent.result_json
-            if result_json:
-                st.session_state.ai_target_result = result_json
-            else:
-                st.session_state.ai_target_result = agent_output
-
-            st.session_state.ai_target_parsed = None
+        if "ai_target_result" not in st.session_state:
+            st.session_state.ai_target_result = None
+        if "ai_target_verification" not in st.session_state:
             st.session_state.ai_target_verification = None
+        if "ai_target_verdicts" not in st.session_state:
             st.session_state.ai_target_verdicts = {}
+        if "agent_log" not in st.session_state:
+            st.session_state.agent_log = []
+        if "ai_target_parsed" not in st.session_state:
+            st.session_state.ai_target_parsed = None
+        if "_regen_preset" not in st.session_state:
+            st.session_state._regen_preset = None
 
-            tracker.complete("타겟 탐색 완료! 근거 검증 시작...")
+        # ── Input Section ─────────────────────────────
+        st.subheader("제품/서비스 정보")
 
-            # Auto-verify immediately after agent completes
-            _auto_verify(st.session_state.ai_target_result, feedback=_task["feedback"])
+        ai_product_desc = st.text_area(
+            "제품/서비스 설명 (필수)",
+            height=150,
+            placeholder="예: Dataset과 연구 목적을 프롬프트로 넣으면 임상시험 시뮬레이션과 바이오마커 발굴 리포트를 생성하는 AI co-scientist",
+            key="ai_product_desc",
+        )
 
-        except Exception as e:
-            if 'tracker' in dir():
-                tracker.fail(f"AI 타겟 추천 실패: {e}")
-            else:
-                st.error(f"AI 타겟 추천 실패: {e}")
-            import traceback
-            st.code(traceback.format_exc())
-        finally:
-            st.session_state.agent_running = False
-        st.rerun()
-
-    # ── Results Section ───────────────────────────
-    if st.session_state.ai_target_result:
-        st.divider()
-        result_text = st.session_state.ai_target_result
-
-        # Parse JSON on first load, then use editable copy
-        if st.session_state.ai_target_parsed is None:
-            json_match = re.search(r"```json\s*\n(.*?)```", result_text, re.DOTALL)
-            parsed = None
-            if json_match:
-                try:
-                    parsed = json.loads(json_match.group(1))
-                except json.JSONDecodeError:
-                    pass
-            if not parsed:
-                try:
-                    parsed = json.loads(result_text)
-                except json.JSONDecodeError:
-                    pass
-            st.session_state.ai_target_parsed = parsed
-
-        parsed = st.session_state.ai_target_parsed
-
-        if parsed:
-            st.subheader("추천 결과")
-            st.success(f"**{parsed.get('product_summary', '')}**")
-
-            # Show agent activity log
-            if st.session_state.agent_log:
-                with st.expander(f"Agent 활동 로그 ({len(st.session_state.agent_log)}건)", expanded=False):
-                    st.code("\n".join(st.session_state.agent_log), language=None)
-
-            # Show analysis if present
-            if parsed.get("analysis"):
-                with st.expander("제품 분석", expanded=True):
-                    st.markdown(parsed["analysis"])
-
-            tier1 = parsed.get("tier1_companies", [])
-            tier2 = parsed.get("tier2_companies", [])
-
-            # Build verification + verdict lookups
-            _vmap = {}
-            if st.session_state.ai_target_verification:
-                for v in st.session_state.ai_target_verification:
-                    _vmap[v.get("name", "")] = v.get("verification", {})
-            _verdict_map = st.session_state.get("ai_target_verdicts", {})
-
-            tab_t1, tab_t2, tab_titles = st.tabs([
-                f"Tier 1 ({len(tier1)}개)",
-                f"Tier 2 ({len(tier2)}개)",
-                "추천 직종",
-            ])
-
-            with tab_t1:
-                if tier1:
-                    for idx, c in enumerate(tier1):
-                        col_card, col_actions = st.columns([5, 1])
-                        with col_card:
-                            _render_company_card(c, _vmap.get(c["name"]), _verdict_map.get(c["name"]))
-                        with col_actions:
-                            st.write("")  # spacing
-                            if st.button("→ T2", key=f"t1to2_{idx}", help="Tier 2로 이동"):
-                                company = tier1.pop(idx)
-                                tier2.append(company)
-                                st.rerun()
-                            if st.button("삭제", key=f"del_t1_{idx}", help="목록에서 제거"):
-                                tier1.pop(idx)
-                                st.rerun()
-                else:
-                    st.info("Tier 1 회사 없음")
-
-            with tab_t2:
-                if tier2:
-                    for idx, c in enumerate(tier2):
-                        col_card, col_actions = st.columns([5, 1])
-                        with col_card:
-                            _render_company_card(c, _vmap.get(c["name"]), _verdict_map.get(c["name"]))
-                        with col_actions:
-                            st.write("")  # spacing
-                            if st.button("→ T1", key=f"t2to1_{idx}", help="Tier 1으로 이동"):
-                                company = tier2.pop(idx)
-                                tier1.append(company)
-                                st.rerun()
-                            if st.button("삭제", key=f"del_t2_{idx}", help="목록에서 제거"):
-                                tier2.pop(idx)
-                                st.rerun()
-                else:
-                    st.info("Tier 2 회사 없음")
-
-            with tab_titles:
-                dm = parsed.get("decision_makers", [])
-                eu = parsed.get("end_users", [])
-                if dm:
-                    st.markdown("**의사결정자 (Decision Makers):**")
-                    for t in dm:
-                        st.markdown(f"- {t}")
-                if eu:
-                    st.markdown("**실제 사용자 (End Users):**")
-                    for t in eu:
-                        st.markdown(f"- {t}")
-
-            # ── Verification Summary ──────────────
-            if _verdict_map:
-                st.divider()
-                st.subheader("근거 교차검증 결과")
-                st.caption("외부 데이터(웹 + ClinicalTrials + PubMed) 수집 후 Claude가 AI 근거와 비교 분석")
-
-                total_v = len(_verdict_map)
-                confirmed = sum(1 for v in _verdict_map.values() if v.get("verdict") == "confirmed")
-                v_partial = sum(1 for v in _verdict_map.values() if v.get("verdict") == "partial")
-                unverified = sum(1 for v in _verdict_map.values() if v.get("verdict") == "unverified")
-                wrong = sum(1 for v in _verdict_map.values() if v.get("verdict") == "wrong")
-
-                vcol1, vcol2, vcol3, vcol4 = st.columns(4)
-                vcol1.metric("✅ 확인됨", f"{confirmed}/{total_v}")
-                vcol2.metric("⚠️ 일부 확인", f"{v_partial}/{total_v}")
-                vcol3.metric("❓ 미검증", f"{unverified}/{total_v}")
-                vcol4.metric("❌ 불일치", f"{wrong}/{total_v}")
-
-                if wrong > 0:
-                    st.error(f"{wrong}개 회사의 AI 근거가 외부 데이터와 불일치합니다. 해당 회사를 확인하세요.")
-                if unverified > 0:
-                    st.warning(f"{unverified}개 회사는 외부 데이터가 부족하여 검증 불가합니다.")
-            elif st.session_state.ai_target_verification:
-                st.divider()
-                st.subheader("근거 검증 결과")
-                st.caption("외부 데이터 수집 완료 (교차검증 미완료)")
-
-                total_v = len(st.session_state.ai_target_verification)
-                verified = sum(1 for v in st.session_state.ai_target_verification
-                               if v.get("verification", {}).get("status") == "verified")
-                partial = sum(1 for v in st.session_state.ai_target_verification
-                              if v.get("verification", {}).get("status") == "partial")
-                no_data = sum(1 for v in st.session_state.ai_target_verification
-                              if v.get("verification", {}).get("status") == "no_data")
-
-                vcol1, vcol2, vcol3 = st.columns(3)
-                vcol1.metric("검증됨", f"{verified}/{total_v}")
-                vcol2.metric("일부 확인", f"{partial}/{total_v}")
-                vcol3.metric("데이터 없음", f"{no_data}/{total_v}")
-
-            # ── Feedback Section ───────────────────
-            st.divider()
-            st.subheader("피드백")
-            st.caption("결과에 대한 피드백을 입력하면 AI가 반영해서 재추천합니다.")
-
-            ai_feedback = st.text_area(
-                "피드백 (자유 입력)",
-                height=100,
-                placeholder="예: CRO는 빼줘, 바이오텍만 남겨, 일본 회사를 더 추가해줘, Tier 2에서 XX는 Tier 1으로 올려줘",
-                key="ai_feedback",
+        col1, col2 = st.columns(2)
+        with col1:
+            ai_target_hint = st.text_input(
+                "희망 대상/관련 직종 (자유 입력, 선택)",
+                placeholder="예: 바이오텍 R&D 담당자, CNS 연구 관련",
+                key="ai_target_hint",
+            )
+        with col2:
+            ai_region = st.text_input(
+                "지역 제한 (선택)",
+                placeholder="예: Japan, US, Europe 등 (비워두면 전체)",
+                key="ai_target_region",
             )
 
-            _has_profile = bool(st.session_state.get("active_profile_id"))
-            fcol1, fcol2, fcol3 = st.columns([2, 2, 1])
-            with fcol1:
-                _fb_global = st.checkbox("글로벌", value=True, key="fb_scope_global",
-                                         help="모든 프로필에 공통 적용")
-                _fb_profile = st.checkbox(
-                    "프로필 전용", value=_has_profile, key="fb_scope_profile",
-                    disabled=not _has_profile,
-                    help="활성 프로필에서만 적용",
+        # Collect companies for exclusion option (from presets + current results)
+        _existing_presets = db.get_presets()
+        _preset_companies = set()
+        for p in _existing_presets:
+            for c in (p.get("companies") or "").split(","):
+                c = c.strip()
+                if c:
+                    _preset_companies.add(c)
+
+        _current_companies = set()
+        if st.session_state.ai_target_parsed:
+            for c in st.session_state.ai_target_parsed.get("tier1_companies", []):
+                _current_companies.add(c.get("name", ""))
+            for c in st.session_state.ai_target_parsed.get("tier2_companies", []):
+                _current_companies.add(c.get("name", ""))
+            _current_companies.discard("")
+
+        _all_excludable = _preset_companies | _current_companies
+
+        exclude_companies_set = set()
+        if _all_excludable:
+            ecol1, ecol2 = st.columns(2)
+            with ecol1:
+                if _preset_companies:
+                    if st.checkbox(
+                        f"프리셋 회사 제외 ({len(_preset_companies)}개)",
+                        help=f"저장된 프리셋: {', '.join(list(_preset_companies)[:8])}{'...' if len(_preset_companies) > 8 else ''}",
+                    ):
+                        exclude_companies_set |= _preset_companies
+            with ecol2:
+                if _current_companies:
+                    if st.checkbox(
+                        f"현재 결과 회사 제외 ({len(_current_companies)}개)",
+                        help="현재 화면에 표시된 회사를 제외하고 새로운 회사만 추천",
+                    ):
+                        exclude_companies_set |= _current_companies
+
+        if st.button("🤖 AI 타겟 추천 실행", type="primary", disabled=not ai_product_desc or st.session_state.get("agent_running")):
+            # Combine product desc with hint
+            full_desc = ai_product_desc
+            if ai_target_hint:
+                full_desc += f"\n\n희망 대상/관련 직종: {ai_target_hint}"
+
+            # Build exclusion list
+            exclude_companies = sorted(exclude_companies_set)
+            exclude_section = ""
+            if exclude_companies:
+                exclude_section = (
+                    f"\n\n제외 대상 회사 (절대 추천하지 말 것): "
+                    f"{', '.join(exclude_companies[:30])}"
                 )
-            with fcol2:
-                if st.button("🔄 피드백 반영 재추천", type="primary", disabled=not ai_feedback or st.session_state.get("agent_running")):
-                    # Save feedback to DB — global and/or profile-specific
-                    _active_pid = st.session_state.get("active_profile_id")
-                    if _fb_global:
-                        db.add_target_feedback(
-                            ai_feedback,
-                            product_summary=parsed.get("product_summary", ""),
-                            profile_id=None,
-                        )
-                    if _fb_profile and _active_pid:
-                        db.add_target_feedback(
-                            ai_feedback,
-                            product_summary=parsed.get("product_summary", ""),
-                            profile_id=_active_pid,
-                        )
-                    prev_json = json.dumps(parsed, ensure_ascii=False)
-                    full_desc = ai_product_desc or ""
-                    if ai_target_hint:
-                        full_desc += f"\n\n희망 대상/관련 직종: {ai_target_hint}"
 
-                    _fb_run_pid = st.session_state.get("active_profile_id")
+            region_line = f"\n지역 제한: {ai_region}" if ai_region else ""
 
-                    # Phase 1: save params and rerun to show overlay
-                    st.session_state._pending_fb_rerun = {
-                        "request": (
-                            f"이전 추천 결과에 대한 사용자 피드백을 반영하여 수정된 결과를 만들어줘.\n\n"
-                            f"## 제품 설명\n{full_desc}\n\n"
-                            f"## 이전 추천 결과\n```json\n{prev_json}\n```\n\n"
-                            f"## 사용자 피드백\n{ai_feedback}\n\n"
-                            f"피드백을 정확히 반영하여 수정해줘. "
-                            f"필요하면 추가 웹 리서치를 해도 좋아. "
-                            f"최종 결과는 반드시 save_results로 저장해줘."
-                        ),
-                        "feedback": db.get_combined_feedback_text(_fb_run_pid),
-                    }
-                    st.session_state.agent_running = True
-                    st.rerun()
+            _ctx = build_campaign_context(st.session_state.get("active_profile"))
+            _ctx_section = f"\n\n{_ctx}" if _ctx else ""
+            agent_request = (
+                f"아래 제품에 대해 타겟 회사를 찾아줘.\n\n"
+                f"## 제품 설명\n{full_desc}"
+                f"{region_line}{exclude_section}{_ctx_section}\n\n"
+                f"다양한 검색어로 웹 리서치를 수행한 뒤, "
+                f"결과를 Tier 1/Tier 2로 분류하고 save_results로 저장해줘."
+            )
 
-            # Phase 2: execute pending feedback re-recommendation
-            if st.session_state.get("_pending_fb_rerun"):
-                _task = st.session_state.pop("_pending_fb_rerun")
-                try:
-                    from agent import CompanyListingAgent
+            # Phase 1: save params and rerun to show overlay
+            _run_profile_id = st.session_state.get("active_profile_id")
+            st.session_state._pending_agent1 = {
+                "request": agent_request,
+                "feedback": db.get_combined_feedback_text(_run_profile_id),
+            }
+            st.session_state.agent_running = True
+            st.rerun()
 
-                    fb_tracker = AgentProgressTracker("agent1")
-                    agent = CompanyListingAgent(
-                        extra_feedback=_task["feedback"],
-                        on_tool_call=fb_tracker.on_tool_call,
-                        on_tool_result=fb_tracker.on_tool_result,
-                    )
-                    agent.run(_task["request"])
+        # Phase 2: execute pending Agent 1 task (overlay is already visible)
+        if st.session_state.get("_pending_agent1"):
+            _task = st.session_state.pop("_pending_agent1")
+            try:
+                from agent import CompanyListingAgent
 
-                    result_json = agent.result_json
-                    if result_json:
-                        st.session_state.ai_target_result = result_json
-                    st.session_state.ai_target_parsed = None
-                    st.session_state.ai_target_verification = None
-                    st.session_state.ai_target_verdicts = {}
-                    fb_tracker.complete("피드백 반영 완료!")
-                except Exception as e:
-                    if 'fb_tracker' in dir():
-                        fb_tracker.fail(f"재추천 실패: {e}")
+                tracker = AgentProgressTracker("agent1")
+
+                agent = CompanyListingAgent(
+                    extra_feedback=_task["feedback"],
+                    on_tool_call=tracker.on_tool_call,
+                    on_tool_result=tracker.on_tool_result,
+                    on_text=tracker.on_text,
+                )
+
+                agent_output = agent.run(_task["request"])
+
+                st.session_state.agent_log = tracker.tool_log
+
+                # Use saved JSON result if available, otherwise try parsing agent output
+                result_json = agent.result_json
+                if result_json:
+                    st.session_state.ai_target_result = result_json
+                else:
+                    st.session_state.ai_target_result = agent_output
+
+                st.session_state.ai_target_parsed = None
+                st.session_state.ai_target_verification = None
+                st.session_state.ai_target_verdicts = {}
+
+                tracker.complete("타겟 탐색 완료! 근거 검증 시작...")
+
+                # Auto-verify immediately after agent completes
+                _auto_verify(st.session_state.ai_target_result, feedback=_task["feedback"])
+
+            except Exception as e:
+                if 'tracker' in dir():
+                    tracker.fail(f"AI 타겟 추천 실패: {e}")
+                else:
+                    st.error(f"AI 타겟 추천 실패: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+            finally:
+                st.session_state.agent_running = False
+            st.rerun()
+
+        # ── Results Section ───────────────────────────
+        if st.session_state.ai_target_result:
+            st.divider()
+            result_text = st.session_state.ai_target_result
+
+            # Parse JSON on first load, then use editable copy
+            if st.session_state.ai_target_parsed is None:
+                json_match = re.search(r"```json\s*\n(.*?)```", result_text, re.DOTALL)
+                parsed = None
+                if json_match:
+                    try:
+                        parsed = json.loads(json_match.group(1))
+                    except json.JSONDecodeError:
+                        pass
+                if not parsed:
+                    try:
+                        parsed = json.loads(result_text)
+                    except json.JSONDecodeError:
+                        pass
+                st.session_state.ai_target_parsed = parsed
+
+            parsed = st.session_state.ai_target_parsed
+
+            if parsed:
+                st.subheader("추천 결과")
+                st.success(f"**{parsed.get('product_summary', '')}**")
+
+                # Show agent activity log
+                if st.session_state.agent_log:
+                    with st.expander(f"Agent 활동 로그 ({len(st.session_state.agent_log)}건)", expanded=False):
+                        st.code("\n".join(st.session_state.agent_log), language=None)
+
+                # Show analysis if present
+                if parsed.get("analysis"):
+                    with st.expander("제품 분석", expanded=True):
+                        st.markdown(parsed["analysis"])
+
+                tier1 = parsed.get("tier1_companies", [])
+                tier2 = parsed.get("tier2_companies", [])
+
+                # Build verification + verdict lookups
+                _vmap = {}
+                if st.session_state.ai_target_verification:
+                    for v in st.session_state.ai_target_verification:
+                        _vmap[v.get("name", "")] = v.get("verification", {})
+                _verdict_map = st.session_state.get("ai_target_verdicts", {})
+
+                _tier_tab = st.radio(
+                    "결과 보기",
+                    ["tier1", "tier2", "titles"],
+                    format_func=lambda x: {
+                        "tier1": f"Tier 1 ({len(tier1)}개)",
+                        "tier2": f"Tier 2 ({len(tier2)}개)",
+                        "titles": "추천 직종",
+                    }[x],
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    key="ai_target_tier_tab",
+                )
+
+                if _tier_tab == "tier1":
+                    if tier1:
+                        for idx, c in enumerate(tier1):
+                            col_card, col_actions = st.columns([5, 1])
+                            with col_card:
+                                _render_company_card(c, _vmap.get(c["name"]), _verdict_map.get(c["name"]))
+                            with col_actions:
+                                st.write("")  # spacing
+                                if st.button("→ T2", key=f"t1to2_{idx}", help="Tier 2로 이동"):
+                                    company = tier1.pop(idx)
+                                    tier2.append(company)
+                                    st.rerun()
+                                if st.button("삭제", key=f"del_t1_{idx}", help="목록에서 제거"):
+                                    tier1.pop(idx)
+                                    st.rerun()
                     else:
-                        st.error(f"재추천 실패: {e}")
-                finally:
-                    st.session_state.agent_running = False
-                st.rerun()
-            with fcol2:
+                        st.info("Tier 1 회사 없음")
+
+                elif _tier_tab == "tier2":
+                    if tier2:
+                        for idx, c in enumerate(tier2):
+                            col_card, col_actions = st.columns([5, 1])
+                            with col_card:
+                                _render_company_card(c, _vmap.get(c["name"]), _verdict_map.get(c["name"]))
+                            with col_actions:
+                                st.write("")  # spacing
+                                if st.button("→ T1", key=f"t2to1_{idx}", help="Tier 1으로 이동"):
+                                    company = tier2.pop(idx)
+                                    tier1.append(company)
+                                    st.rerun()
+                                if st.button("삭제", key=f"del_t2_{idx}", help="목록에서 제거"):
+                                    tier2.pop(idx)
+                                    st.rerun()
+                    else:
+                        st.info("Tier 2 회사 없음")
+
+                else:  # titles
+                    dm = parsed.get("decision_makers", [])
+                    eu = parsed.get("end_users", [])
+                    if dm:
+                        st.markdown("**의사결정자 (Decision Makers):**")
+                        for t in dm:
+                            st.markdown(f"- {t}")
+                    if eu:
+                        st.markdown("**실제 사용자 (End Users):**")
+                        for t in eu:
+                            st.markdown(f"- {t}")
+
+                # ── Verification Summary ──────────────
+                if _verdict_map:
+                    st.divider()
+                    st.subheader("근거 교차검증 결과")
+                    st.caption("외부 데이터(웹 + ClinicalTrials + PubMed) 수집 후 Claude가 AI 근거와 비교 분석")
+
+                    total_v = len(_verdict_map)
+                    confirmed = sum(1 for v in _verdict_map.values() if v.get("verdict") == "confirmed")
+                    v_partial = sum(1 for v in _verdict_map.values() if v.get("verdict") == "partial")
+                    unverified = sum(1 for v in _verdict_map.values() if v.get("verdict") == "unverified")
+                    wrong = sum(1 for v in _verdict_map.values() if v.get("verdict") == "wrong")
+
+                    vcol1, vcol2, vcol3, vcol4 = st.columns(4)
+                    vcol1.metric("✅ 확인됨", f"{confirmed}/{total_v}")
+                    vcol2.metric("⚠️ 일부 확인", f"{v_partial}/{total_v}")
+                    vcol3.metric("❓ 미검증", f"{unverified}/{total_v}")
+                    vcol4.metric("❌ 불일치", f"{wrong}/{total_v}")
+
+                    if wrong > 0:
+                        st.error(f"{wrong}개 회사의 AI 근거가 외부 데이터와 불일치합니다. 해당 회사를 확인하세요.")
+                    if unverified > 0:
+                        st.warning(f"{unverified}개 회사는 외부 데이터가 부족하여 검증 불가합니다.")
+                elif st.session_state.ai_target_verification:
+                    st.divider()
+                    st.subheader("근거 검증 결과")
+                    st.caption("외부 데이터 수집 완료 (교차검증 미완료)")
+
+                    total_v = len(st.session_state.ai_target_verification)
+                    verified = sum(1 for v in st.session_state.ai_target_verification
+                                   if v.get("verification", {}).get("status") == "verified")
+                    partial = sum(1 for v in st.session_state.ai_target_verification
+                                  if v.get("verification", {}).get("status") == "partial")
+                    no_data = sum(1 for v in st.session_state.ai_target_verification
+                                  if v.get("verification", {}).get("status") == "no_data")
+
+                    vcol1, vcol2, vcol3 = st.columns(3)
+                    vcol1.metric("검증됨", f"{verified}/{total_v}")
+                    vcol2.metric("일부 확인", f"{partial}/{total_v}")
+                    vcol3.metric("데이터 없음", f"{no_data}/{total_v}")
+
+                # ── Export Results as Markdown ─────────
+                st.divider()
+                st.subheader("결과 내보내기")
+
+                def _build_company_export_md():
+                    lines = [f"# 타겟 회사 추천 결과\n"]
+                    lines.append(f"**제품 요약:** {parsed.get('product_summary', '')}\n")
+                    _exp_analysis = parsed.get("analysis", "")
+                    if _exp_analysis:
+                        lines.append(f"## 분석\n{_exp_analysis}\n")
+
+                    for tier_label, tier_list, tier_name in [
+                        ("Tier 1 (핵심 타겟)", tier1, "tier1"),
+                        ("Tier 2 (잠재적 타겟)", tier2, "tier2"),
+                    ]:
+                        lines.append(f"## {tier_label} — {len(tier_list)}개\n")
+                        for i, c in enumerate(tier_list, 1):
+                            c_name = c.get("name", "")
+                            lines.append(f"### {i}. {c_name}")
+                            if c.get("reason"):
+                                lines.append(f"- **요약:** {c['reason']}")
+                            if c.get("evidence"):
+                                lines.append(f"- **근거:** {c['evidence']}")
+                            if c.get("tier_reason"):
+                                lines.append(f"- **Tier 산정:** {c['tier_reason']}")
+                            # Add verdict if available
+                            _v = _verdict_map.get(c_name, {})
+                            if _v:
+                                _emoji = {"confirmed": "✅", "partial": "⚠️", "unverified": "❓", "wrong": "❌"}.get(_v.get("verdict", ""), "")
+                                lines.append(f"- **교차검증:** {_emoji} {_v.get('verdict', '')} — {_v.get('explanation', '')}")
+                            lines.append("")
+
+                    dm = parsed.get("decision_makers", [])
+                    eu = parsed.get("end_users", [])
+                    if dm or eu:
+                        lines.append("## 추천 직종\n")
+                        if dm:
+                            lines.append(f"**의사결정자:** {', '.join(dm)}")
+                        if eu:
+                            lines.append(f"**실제 사용자:** {', '.join(eu)}")
+                        lines.append("")
+
+                    return "\n".join(lines)
+
+                _export_md = _build_company_export_md()
+                st.download_button(
+                    "📥 Markdown으로 내보내기",
+                    data=_export_md,
+                    file_name="target_companies_result.md",
+                    mime="text/markdown",
+                    key="export_company_md",
+                )
+
+                # ── Feedback Section ───────────────────
+                st.divider()
+                st.subheader("피드백")
+                st.caption("결과에 대한 피드백을 입력하면 AI가 반영해서 재추천합니다.")
+
+                ai_feedback = st.text_area(
+                    "피드백 (자유 입력)",
+                    height=100,
+                    placeholder="예: CRO는 빼줘, 바이오텍만 남겨, 일본 회사를 더 추가해줘, Tier 2에서 XX는 Tier 1으로 올려줘",
+                    key="ai_feedback",
+                )
+
+                _has_profile = bool(st.session_state.get("active_profile_id"))
+                fcol1, fcol2, fcol3 = st.columns([2, 2, 1])
+                with fcol1:
+                    _fb_global = st.checkbox("글로벌", value=True, key="fb_scope_global",
+                                             help="모든 프로필에 공통 적용")
+                    _fb_profile = st.checkbox(
+                        "프로필 전용", value=_has_profile, key="fb_scope_profile",
+                        disabled=not _has_profile,
+                        help="활성 프로필에서만 적용",
+                    )
+                with fcol2:
+                    if st.button("🔄 피드백 반영 재추천", type="primary", disabled=not ai_feedback or st.session_state.get("agent_running")):
+                        # Save feedback to DB — global and/or profile-specific
+                        _active_pid = st.session_state.get("active_profile_id")
+                        if _fb_global:
+                            db.add_target_feedback(
+                                ai_feedback,
+                                product_summary=parsed.get("product_summary", ""),
+                                profile_id=None,
+                            )
+                        if _fb_profile and _active_pid:
+                            db.add_target_feedback(
+                                ai_feedback,
+                                product_summary=parsed.get("product_summary", ""),
+                                profile_id=_active_pid,
+                            )
+                        prev_json = json.dumps(parsed, ensure_ascii=False)
+                        full_desc = ai_product_desc or ""
+                        if ai_target_hint:
+                            full_desc += f"\n\n희망 대상/관련 직종: {ai_target_hint}"
+
+                        _fb_run_pid = st.session_state.get("active_profile_id")
+
+                        # Phase 1: save params and rerun to show overlay
+                        st.session_state._pending_fb_rerun = {
+                            "request": (
+                                f"이전 추천 결과에 대한 사용자 피드백을 반영하여 수정된 결과를 만들어줘.\n\n"
+                                f"## 제품 설명\n{full_desc}\n\n"
+                                f"## 이전 추천 결과\n```json\n{prev_json}\n```\n\n"
+                                f"## 사용자 피드백\n{ai_feedback}\n\n"
+                                f"피드백을 정확히 반영하여 수정해줘. "
+                                f"필요하면 추가 웹 리서치를 해도 좋아. "
+                                f"최종 결과는 반드시 save_results로 저장해줘."
+                            ),
+                            "feedback": db.get_combined_feedback_text(_fb_run_pid),
+                        }
+                        st.session_state.agent_running = True
+                        st.rerun()
+
+                # Phase 2: execute pending feedback re-recommendation
+                if st.session_state.get("_pending_fb_rerun"):
+                    _task = st.session_state.pop("_pending_fb_rerun")
+                    try:
+                        from agent import CompanyListingAgent
+
+                        fb_tracker = AgentProgressTracker("agent1")
+                        agent = CompanyListingAgent(
+                            extra_feedback=_task["feedback"],
+                            on_tool_call=fb_tracker.on_tool_call,
+                            on_tool_result=fb_tracker.on_tool_result,
+                        )
+                        agent.run(_task["request"])
+
+                        result_json = agent.result_json
+                        if result_json:
+                            st.session_state.ai_target_result = result_json
+                        st.session_state.ai_target_parsed = None
+                        st.session_state.ai_target_verification = None
+                        st.session_state.ai_target_verdicts = {}
+                        fb_tracker.complete("피드백 반영 완료!")
+                    except Exception as e:
+                        if 'fb_tracker' in dir():
+                            fb_tracker.fail(f"재추천 실패: {e}")
+                        else:
+                            st.error(f"재추천 실패: {e}")
+                    finally:
+                        st.session_state.agent_running = False
+                    st.rerun()
+                with fcol2:
+                    if st.button("🗑️ 결과 초기화"):
+                        st.session_state.ai_target_result = None
+                        st.session_state.ai_target_parsed = None
+                        st.session_state.ai_target_verification = None
+                        st.session_state.ai_target_verdicts = {}
+                        st.session_state.agent_log = []
+                        st.rerun()
+
+                # ── Save as Preset ─────────────────────
+                st.divider()
+                st.subheader("프리셋으로 저장")
+                st.caption("추천 결과를 프리셋으로 저장하면 '컨택 서칭' 페이지에서 바로 사용할 수 있습니다.")
+
+                rec = parsed.get("recommended_search_params", {})
+                tier1_names = [c["name"] for c in parsed.get("tier1_companies", [])]
+                tier2_names = [c["name"] for c in parsed.get("tier2_companies", [])]
+                # Combine all recommended titles (decision_makers + end_users)
+                _all_titles = parsed.get("decision_makers", []) + parsed.get("end_users", [])
+                _all_titles_str = ", ".join(_all_titles) if _all_titles else rec.get("titles", "")
+
+                save_scope = st.radio(
+                    "저장할 회사 범위",
+                    ["Tier 1 + Tier 2 전체", "Tier 1만", "Tier 2만", "Tier 1 / Tier 2 각각 (2개 프리셋)"],
+                    horizontal=True,
+                    key="ai_save_scope",
+                )
+
+                if save_scope == "Tier 1 / Tier 2 각각 (2개 프리셋)":
+                    _save_groups = [("_T1", tier1_names), ("_T2", tier2_names)]
+                    companies_to_save = tier1_names + tier2_names  # for preview
+                elif save_scope == "Tier 2만":
+                    _save_groups = [("", tier2_names)]
+                    companies_to_save = tier2_names
+                elif save_scope == "Tier 1만":
+                    _save_groups = [("", tier1_names)]
+                    companies_to_save = tier1_names
+                else:
+                    _save_groups = [("", tier1_names + tier2_names)]
+                    companies_to_save = tier1_names + tier2_names
+
+                # Preview what will be saved
+                with st.expander("저장될 프리셋 내용 미리보기", expanded=False):
+                    st.markdown(f"**산업:** {rec.get('industry', '')}")
+                    st.markdown(f"**직함:** {_all_titles_str}")
+                    st.markdown(f"**키워드:** {rec.get('keywords', '')}")
+                    if save_scope == "Tier 1 / Tier 2 각각 (2개 프리셋)":
+                        st.markdown(f"**Tier 1 ({len(tier1_names)}개):** {', '.join(tier1_names[:10])}{'...' if len(tier1_names) > 10 else ''}")
+                        st.markdown(f"**Tier 2 ({len(tier2_names)}개):** {', '.join(tier2_names[:10])}{'...' if len(tier2_names) > 10 else ''}")
+                    else:
+                        st.markdown(f"**회사 ({len(companies_to_save)}개):** {', '.join(companies_to_save[:10])}{'...' if len(companies_to_save) > 10 else ''}")
+
+                if save_scope == "Tier 1 / Tier 2 각각 (2개 프리셋)":
+                    _ncol1, _ncol2 = st.columns(2)
+                    with _ncol1:
+                        preset_name_t1 = st.text_input(
+                            "Tier 1 프리셋 이름",
+                            value=f"AI_{datetime.now().strftime('%y%m%d')}_T1",
+                            key="ai_preset_name_t1",
+                        )
+                    with _ncol2:
+                        preset_name_t2 = st.text_input(
+                            "Tier 2 프리셋 이름",
+                            value=f"AI_{datetime.now().strftime('%y%m%d')}_T2",
+                            key="ai_preset_name_t2",
+                        )
+                    # Override _save_groups with individual names
+                    _save_groups = [(preset_name_t1, tier1_names), (preset_name_t2, tier2_names)]
+                    _can_save = bool(preset_name_t1 and preset_name_t2)
+                else:
+                    preset_name = st.text_input(
+                        "프리셋 이름",
+                        value=f"AI_{datetime.now().strftime('%y%m%d')}",
+                        key="ai_preset_name",
+                    )
+                    # Use preset_name directly as the full name
+                    _save_groups = [(preset_name, c) for _, c in _save_groups]
+                    _can_save = bool(preset_name)
+
+                if st.button("💾 프리셋 저장 → 컨택 서칭", type="primary", disabled=not _can_save):
+                        for _name, _companies in _save_groups:
+                            if not _companies:
+                                continue
+                            db.save_preset(
+                                name=_name,
+                                industry=rec.get("industry", ""),
+                                titles=_all_titles_str,
+                                locations=ai_region or "",
+                                companies=", ".join(_companies),
+                                keywords=rec.get("keywords", ""),
+                                max_results=100,
+                                feedback_hash=_get_feedback_hash(),
+                                product_description=ai_product_desc or "",
+                                target_hint=ai_target_hint or "",
+                                target_region=ai_region or "",
+                            )
+                        _saved_names = ", ".join(f"'{n}'" for n, c in _save_groups if c)
+                        st.session_state.ai_target_result = None
+                        st.session_state.ai_target_parsed = None
+                        st.session_state.ai_target_verification = None
+                        st.session_state.ai_target_verdicts = {}
+                        st.session_state.ai_web_context = ""
+                        st.session_state.active_page = "🔍 컨택 서칭"
+                        st.session_state.contact_search_mode = "manual"
+                        st.session_state.prospect_step = "search"
+                        st.success(f"프리셋 {_saved_names} 저장 완료! 컨택 서칭으로 이동합니다.")
+                        st.rerun()
+            else:
+                # Couldn't parse JSON, show raw
+                st.warning("JSON 파싱 실패. 원본 결과:")
+                st.markdown(result_text[:3000])
+                if len(result_text) > 3000:
+                    st.caption("... (출력이 길어 일부만 표시)")
                 if st.button("🗑️ 결과 초기화"):
                     st.session_state.ai_target_result = None
                     st.session_state.ai_target_parsed = None
                     st.session_state.ai_target_verification = None
                     st.session_state.ai_target_verdicts = {}
-                    st.session_state.agent_log = []
+                    st.session_state.ai_web_context = ""
                     st.rerun()
 
-            # ── Save as Preset ─────────────────────
-            st.divider()
-            st.subheader("프리셋으로 저장")
-            st.caption("추천 결과를 프리셋으로 저장하면 '컨택 서칭' 페이지에서 바로 사용할 수 있습니다.")
+        # ── Previous presets (for reference) ──────────
+        st.divider()
+        st.subheader("저장된 프리셋 목록")
+        saved_presets = db.get_presets()
+        current_fb_hash = _get_feedback_hash()
+        if saved_presets:
+            for sp in saved_presets:
+                companies_preview = sp.get("companies", "")
+                companies_count = len([c for c in companies_preview.split(",") if c.strip()]) if companies_preview else 0
+                stale = sp.get("feedback_hash") and sp["feedback_hash"] != current_fb_hash
+                stale_tag = " ⚠️ _피드백 변경됨_" if stale else ""
+                has_product_desc = bool((sp.get("product_description") or "").strip())
+                sp_col1, sp_col2, sp_col3 = st.columns([5, 1, 1])
+                with sp_col1:
+                    st.markdown(
+                        f"- **{sp['name']}** — {sp.get('industry', '')} | "
+                        f"직함: {sp.get('titles', '')[:30]} | "
+                        f"회사: {companies_count}개{stale_tag}"
+                    )
+                with sp_col2:
+                    regen_disabled = not has_product_desc
+                    regen_help = "제품 설명 미저장 — 새 프리셋부터 재생성 가능" if regen_disabled else "현재 피드백으로 타겟 재탐색"
+                    if st.button("재생성", key=f"regen_preset_{sp['id']}", disabled=regen_disabled or st.session_state.get("agent_running"), help=regen_help):
+                        st.session_state._regen_preset = sp
+                        st.session_state.agent_running = True
+                        st.rerun()
+                with sp_col3:
+                    if st.button("삭제", key=f"del_preset_{sp['id']}"):
+                        db.delete_preset(sp["id"])
+                        st.rerun()
 
-            rec = parsed.get("recommended_search_params", {})
-            tier1_names = [c["name"] for c in parsed.get("tier1_companies", [])]
-            tier2_names = [c["name"] for c in parsed.get("tier2_companies", [])]
+            # Phase 2: handle preset regeneration (overlay already visible)
+            if st.session_state.get("_regen_preset") and st.session_state.get("agent_running"):
+                rp = st.session_state._regen_preset
+                st.info(f"프리셋 **{rp['name']}** 재생성 중... (피드백 반영)")
+                regen_desc = rp.get("product_description", "")
+                regen_hint = rp.get("target_hint", "")
+                regen_region = rp.get("target_region", "")
 
-            save_scope = st.radio(
-                "저장할 회사 범위",
-                ["Tier 1 + Tier 2 전체", "Tier 1만", "Tier 2만", "Tier 1 / Tier 2 각각 (2개 프리셋)"],
-                horizontal=True,
-                key="ai_save_scope",
-            )
+                full_desc = regen_desc
+                if regen_hint:
+                    full_desc += f"\n\n희망 대상/관련 직종: {regen_hint}"
 
-            if save_scope == "Tier 1 / Tier 2 각각 (2개 프리셋)":
-                _save_groups = [("_T1", tier1_names), ("_T2", tier2_names)]
-                companies_to_save = tier1_names + tier2_names  # for preview
-            elif save_scope == "Tier 2만":
-                _save_groups = [("", tier2_names)]
-                companies_to_save = tier2_names
-            elif save_scope == "Tier 1만":
-                _save_groups = [("", tier1_names)]
-                companies_to_save = tier1_names
-            else:
-                _save_groups = [("", tier1_names + tier2_names)]
-                companies_to_save = tier1_names + tier2_names
+                region_line = f"\n지역 제한: {regen_region}" if regen_region else ""
 
-            # Preview what will be saved
-            with st.expander("저장될 프리셋 내용 미리보기", expanded=False):
-                st.markdown(f"**산업:** {rec.get('industry', '')}")
-                st.markdown(f"**직함:** {rec.get('titles', '')}")
-                st.markdown(f"**키워드:** {rec.get('keywords', '')}")
-                if save_scope == "Tier 1 / Tier 2 각각 (2개 프리셋)":
-                    st.markdown(f"**Tier 1 ({len(tier1_names)}개):** {', '.join(tier1_names[:10])}{'...' if len(tier1_names) > 10 else ''}")
-                    st.markdown(f"**Tier 2 ({len(tier2_names)}개):** {', '.join(tier2_names[:10])}{'...' if len(tier2_names) > 10 else ''}")
-                else:
-                    st.markdown(f"**회사 ({len(companies_to_save)}개):** {', '.join(companies_to_save[:10])}{'...' if len(companies_to_save) > 10 else ''}")
+                existing_companies = [c.strip() for c in rp.get("companies", "").split(",") if c.strip()]
 
-            pcol1, pcol2 = st.columns([3, 1])
-            with pcol1:
-                preset_name = st.text_input(
-                    "프리셋 이름",
-                    value=f"AI_{datetime.now().strftime('%y%m%d')}",
-                    key="ai_preset_name",
+                _profile_id = st.session_state.get("active_profile_id")
+                _profile_fb = db.get_combined_feedback_text(_profile_id)
+
+                _ctx = build_campaign_context(st.session_state.get("active_profile"))
+                _ctx_section = f"\n\n{_ctx}" if _ctx else ""
+
+                agent_request = (
+                    f"아래 제품에 대해 타겟 회사를 찾아줘.\n\n"
+                    f"## 제품 설명\n{full_desc}"
+                    f"{region_line}{_ctx_section}\n\n"
+                    f"다양한 검색어로 웹 리서치를 수행한 뒤, "
+                    f"결과를 Tier 1/Tier 2로 분류하고 save_results로 저장해줘."
                 )
-            with pcol2:
-                st.markdown("<br>", unsafe_allow_html=True)
-                if st.button("💾 프리셋 저장 → 컨택 서칭", type="primary", disabled=not preset_name):
-                    for _suffix, _companies in _save_groups:
-                        if not _companies:
-                            continue
-                        db.save_preset(
-                            name=f"{preset_name}{_suffix}",
-                            industry=rec.get("industry", ""),
-                            titles=rec.get("titles", ""),
-                            locations=ai_region or "",
-                            companies=", ".join(_companies),
-                            keywords=rec.get("keywords", ""),
-                            max_results=100,
-                            feedback_hash=_get_feedback_hash(),
-                            product_description=ai_product_desc or "",
-                            target_hint=ai_target_hint or "",
-                            target_region=ai_region or "",
-                        )
-                    _saved_names = ", ".join(f"'{preset_name}{s}'" for s, c in _save_groups if c)
-                    st.session_state.ai_target_result = None
+
+                try:
+                    from agent import CompanyListingAgent
+
+                    regen_tracker = AgentProgressTracker("agent1")
+                    agent = CompanyListingAgent(
+                        extra_feedback=_profile_fb,
+                        on_tool_call=regen_tracker.on_tool_call,
+                        on_tool_result=regen_tracker.on_tool_result,
+                        on_text=regen_tracker.on_text,
+                    )
+                    agent.run(agent_request)
+
+                    result_json = agent.result_json
+                    if result_json:
+                        st.session_state.ai_target_result = result_json
+                    else:
+                        st.session_state.ai_target_result = None
+
                     st.session_state.ai_target_parsed = None
                     st.session_state.ai_target_verification = None
                     st.session_state.ai_target_verdicts = {}
-                    st.session_state.ai_web_context = ""
-                    st.session_state.active_page = "🔍 컨택 서칭"
-                    st.session_state.contact_search_mode = "manual"
-                    st.session_state.prospect_step = "search"
-                    st.success(f"프리셋 {_saved_names} 저장 완료! 컨택 서칭으로 이동합니다.")
-                    st.rerun()
-        else:
-            # Couldn't parse JSON, show raw
-            st.warning("JSON 파싱 실패. 원본 결과:")
-            st.markdown(result_text[:3000])
-            if len(result_text) > 3000:
-                st.caption("... (출력이 길어 일부만 표시)")
-            if st.button("🗑️ 결과 초기화"):
-                st.session_state.ai_target_result = None
-                st.session_state.ai_target_parsed = None
-                st.session_state.ai_target_verification = None
-                st.session_state.ai_target_verdicts = {}
-                st.session_state.ai_web_context = ""
+                    regen_tracker.complete("재생성 완료!")
+
+                    # Auto-verify
+                    if st.session_state.ai_target_result:
+                        _auto_verify(st.session_state.ai_target_result, feedback=_profile_fb)
+                except Exception as e:
+                    st.error(f"재생성 실패: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+                finally:
+                    st.session_state._regen_preset = None
+                    st.session_state.agent_running = False
                 st.rerun()
-
-    # ── Previous presets (for reference) ──────────
-    st.divider()
-    st.subheader("저장된 프리셋 목록")
-    saved_presets = db.get_presets()
-    current_fb_hash = _get_feedback_hash()
-    if saved_presets:
-        for sp in saved_presets:
-            companies_preview = sp.get("companies", "")
-            companies_count = len([c for c in companies_preview.split(",") if c.strip()]) if companies_preview else 0
-            stale = sp.get("feedback_hash") and sp["feedback_hash"] != current_fb_hash
-            stale_tag = " ⚠️ _피드백 변경됨_" if stale else ""
-            has_product_desc = bool((sp.get("product_description") or "").strip())
-            sp_col1, sp_col2, sp_col3 = st.columns([5, 1, 1])
-            with sp_col1:
-                st.markdown(
-                    f"- **{sp['name']}** — {sp.get('industry', '')} | "
-                    f"직함: {sp.get('titles', '')[:30]} | "
-                    f"회사: {companies_count}개{stale_tag}"
-                )
-            with sp_col2:
-                regen_disabled = not has_product_desc
-                regen_help = "제품 설명 미저장 — 새 프리셋부터 재생성 가능" if regen_disabled else "현재 피드백으로 타겟 재탐색"
-                if st.button("재생성", key=f"regen_preset_{sp['id']}", disabled=regen_disabled or st.session_state.get("agent_running"), help=regen_help):
-                    st.session_state._regen_preset = sp
-                    st.session_state.agent_running = True
-                    st.rerun()
-            with sp_col3:
-                if st.button("삭제", key=f"del_preset_{sp['id']}"):
-                    db.delete_preset(sp["id"])
-                    st.rerun()
-
-        # Phase 2: handle preset regeneration (overlay already visible)
-        if st.session_state.get("_regen_preset") and st.session_state.get("agent_running"):
-            rp = st.session_state._regen_preset
-            st.info(f"프리셋 **{rp['name']}** 재생성 중... (피드백 반영)")
-            regen_desc = rp.get("product_description", "")
-            regen_hint = rp.get("target_hint", "")
-            regen_region = rp.get("target_region", "")
-
-            full_desc = regen_desc
-            if regen_hint:
-                full_desc += f"\n\n희망 대상/관련 직종: {regen_hint}"
-
-            region_line = f"\n지역 제한: {regen_region}" if regen_region else ""
-
-            existing_companies = [c.strip() for c in rp.get("companies", "").split(",") if c.strip()]
-
-            _profile_id = st.session_state.get("active_profile_id")
-            _profile_fb = db.get_combined_feedback_text(_profile_id)
-
-            _ctx = build_campaign_context(st.session_state.get("active_profile"))
-            _ctx_section = f"\n\n{_ctx}" if _ctx else ""
-
-            agent_request = (
-                f"아래 제품에 대해 타겟 회사를 찾아줘.\n\n"
-                f"## 제품 설명\n{full_desc}"
-                f"{region_line}{_ctx_section}\n\n"
-                f"다양한 검색어로 웹 리서치를 수행한 뒤, "
-                f"결과를 Tier 1/Tier 2로 분류하고 save_results로 저장해줘."
-            )
-
-            try:
-                from agent import CompanyListingAgent
-
-                regen_tracker = AgentProgressTracker("agent1")
-                agent = CompanyListingAgent(
-                    extra_feedback=_profile_fb,
-                    on_tool_call=regen_tracker.on_tool_call,
-                    on_tool_result=regen_tracker.on_tool_result,
-                    on_text=regen_tracker.on_text,
-                )
-                agent.run(agent_request)
-
-                result_json = agent.result_json
-                if result_json:
-                    st.session_state.ai_target_result = result_json
-                else:
-                    st.session_state.ai_target_result = None
-
-                st.session_state.ai_target_parsed = None
-                st.session_state.ai_target_verification = None
-                st.session_state.ai_target_verdicts = {}
-                regen_tracker.complete("재생성 완료!")
-
-                # Auto-verify
-                if st.session_state.ai_target_result:
-                    _auto_verify(st.session_state.ai_target_result, feedback=_profile_fb)
-            except Exception as e:
-                st.error(f"재생성 실패: {e}")
-                import traceback
-                st.code(traceback.format_exc())
-            finally:
-                st.session_state._regen_preset = None
-                st.session_state.agent_running = False
-            st.rerun()
-    else:
-        st.info("저장된 프리셋이 없습니다. AI 타겟 추천을 실행해서 프리셋을 만들어보세요.")
-
-    # ── Feedback Log Management ──────────────────
-    st.divider()
-    st.subheader("피드백 이력 관리")
-
-    _active_pid = st.session_state.get("active_profile_id")
-    _active_profile_name = ""
-    if _active_pid:
-        _ap_data = db.get_campaign_profile(_active_pid)
-        _active_profile_name = _ap_data["name"] if _ap_data else ""
-
-    fb_tab_global, fb_tab_profile = st.tabs([
-        "글로벌 (모든 프로필 공통)",
-        f"프로필 전용 ({_active_profile_name})" if _active_profile_name else "프로필 전용 (미선택)",
-    ])
-
-    with fb_tab_global:
-        st.caption("여기에 누적된 피드백은 **모든** 타겟 추천 시 자동 반영됩니다.")
-        # Read and parse file-based global feedback entries
-        feedback_entries = []
-        if _TARGET_FEEDBACK_PATH.exists():
-            raw = _TARGET_FEEDBACK_PATH.read_text(encoding="utf-8")
-            for line in raw.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("- ["):
-                    feedback_entries.append(stripped)
-
-        # Also show DB-based global feedback
-        db_global_fb = db.get_target_feedback(profile_id=None)
-
-        if feedback_entries:
-            st.markdown("**파일 기반 (레거시)**")
-            for i, entry in enumerate(feedback_entries):
-                col_text, col_del = st.columns([9, 1])
-                with col_text:
-                    st.markdown(entry)
-                with col_del:
-                    if st.button("x", key=f"del_fb_{i}"):
-                        feedback_entries.pop(i)
-                        _rewrite_feedback_log(feedback_entries)
-                        st.rerun()
-
-        if db_global_fb:
-            for fb in db_global_fb:
-                col_text, col_del = st.columns([9, 1])
-                ts = fb["created_at"][:16] if fb.get("created_at") else ""
-                ps = f"({fb['product_summary']}) " if fb.get("product_summary") else ""
-                with col_text:
-                    st.markdown(f"- [{ts}] {ps}{fb['feedback']}")
-                with col_del:
-                    if st.button("x", key=f"del_dbfb_g_{fb['id']}"):
-                        db.delete_target_feedback(fb["id"])
-                        st.rerun()
-
-        total_global = len(feedback_entries) + len(db_global_fb)
-        if total_global:
-            st.caption(f"총 {total_global}건")
         else:
-            st.info("글로벌 피드백이 없습니다.")
+            st.info("저장된 프리셋이 없습니다. AI 타겟 추천을 실행해서 프리셋을 만들어보세요.")
 
-    with fb_tab_profile:
-        if not _active_pid:
-            st.warning("캠페인 프로필을 먼저 활성화하세요. 이 탭은 활성 프로필 전용 피드백을 관리합니다.")
-        else:
-            st.caption(f"**{_active_profile_name}** 프로필에서 타겟 추천할 때만 적용되는 피드백입니다.")
-            profile_fb = db.get_target_feedback(profile_id=_active_pid)
-            if profile_fb:
-                for fb in profile_fb:
+        # ── Feedback Log Management ──────────────────
+        st.divider()
+        st.subheader("피드백 이력 관리")
+
+        _active_pid = st.session_state.get("active_profile_id")
+        _active_profile_name = ""
+        if _active_pid:
+            _ap_data = db.get_campaign_profile(_active_pid)
+            _active_profile_name = _ap_data["name"] if _ap_data else ""
+
+        fb_tab_global, fb_tab_profile = st.tabs([
+            "글로벌 (모든 프로필 공통)",
+            f"프로필 전용 ({_active_profile_name})" if _active_profile_name else "프로필 전용 (미선택)",
+        ])
+
+        with fb_tab_global:
+            st.caption("여기에 누적된 피드백은 **모든** 타겟 추천 시 자동 반영됩니다.")
+            # Read and parse file-based global feedback entries
+            feedback_entries = []
+            if _TARGET_FEEDBACK_PATH.exists():
+                raw = _TARGET_FEEDBACK_PATH.read_text(encoding="utf-8")
+                for line in raw.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("- ["):
+                        feedback_entries.append(stripped)
+
+            # Also show DB-based global feedback
+            db_global_fb = db.get_target_feedback(profile_id=None)
+
+            if feedback_entries:
+                st.markdown("**파일 기반 (레거시)**")
+                for i, entry in enumerate(feedback_entries):
+                    col_text, col_del = st.columns([9, 1])
+                    with col_text:
+                        st.markdown(entry)
+                    with col_del:
+                        if st.button("x", key=f"del_fb_{i}"):
+                            feedback_entries.pop(i)
+                            _rewrite_feedback_log(feedback_entries)
+                            st.rerun()
+
+            if db_global_fb:
+                for fb in db_global_fb:
                     col_text, col_del = st.columns([9, 1])
                     ts = fb["created_at"][:16] if fb.get("created_at") else ""
                     ps = f"({fb['product_summary']}) " if fb.get("product_summary") else ""
                     with col_text:
                         st.markdown(f"- [{ts}] {ps}{fb['feedback']}")
                     with col_del:
-                        if st.button("x", key=f"del_dbfb_p_{fb['id']}"):
+                        if st.button("x", key=f"del_dbfb_g_{fb['id']}"):
                             db.delete_target_feedback(fb["id"])
                             st.rerun()
-                st.caption(f"총 {len(profile_fb)}건")
-            else:
-                st.info(f"'{_active_profile_name}' 프로필 전용 피드백이 없습니다.")
 
-    # ── Unified feedback input (below tabs) ──────────
-    st.markdown("#### 피드백 추가")
-    manual_fb = st.text_input(
-        "피드백 내용",
-        placeholder="예: CRO/CMO 회사는 항상 제외, 바이오텍만 남겨줘",
-        key="manual_fb_unified",
-    )
-    _uf_c1, _uf_c2, _uf_c3 = st.columns([1, 1, 1])
-    with _uf_c1:
-        _uf_global = st.checkbox("글로벌 (모든 프로필)", value=True, key="uf_scope_global")
-    with _uf_c2:
-        _uf_profile = st.checkbox(
-            f"프로필 전용 ({_active_profile_name})" if _active_profile_name else "프로필 전용 (미선택)",
-            value=bool(_active_pid),
-            key="uf_scope_profile",
-            disabled=not _active_pid,
+            total_global = len(feedback_entries) + len(db_global_fb)
+            if total_global:
+                st.caption(f"총 {total_global}건")
+            else:
+                st.info("글로벌 피드백이 없습니다.")
+
+        with fb_tab_profile:
+            if not _active_pid:
+                st.warning("캠페인 프로필을 먼저 활성화하세요. 이 탭은 활성 프로필 전용 피드백을 관리합니다.")
+            else:
+                st.caption(f"**{_active_profile_name}** 프로필에서 타겟 추천할 때만 적용되는 피드백입니다.")
+                profile_fb = db.get_target_feedback(profile_id=_active_pid)
+                if profile_fb:
+                    for fb in profile_fb:
+                        col_text, col_del = st.columns([9, 1])
+                        ts = fb["created_at"][:16] if fb.get("created_at") else ""
+                        ps = f"({fb['product_summary']}) " if fb.get("product_summary") else ""
+                        with col_text:
+                            st.markdown(f"- [{ts}] {ps}{fb['feedback']}")
+                        with col_del:
+                            if st.button("x", key=f"del_dbfb_p_{fb['id']}"):
+                                db.delete_target_feedback(fb["id"])
+                                st.rerun()
+                    st.caption(f"총 {len(profile_fb)}건")
+                else:
+                    st.info(f"'{_active_profile_name}' 프로필 전용 피드백이 없습니다.")
+
+        # ── Unified feedback input (below tabs) ──────────
+        st.markdown("#### 피드백 추가")
+        manual_fb = st.text_input(
+            "피드백 내용",
+            placeholder="예: CRO/CMO 회사는 항상 제외, 바이오텍만 남겨줘",
+            key="manual_fb_unified",
         )
-    with _uf_c3:
-        if st.button("추가", key="add_fb_unified", disabled=not manual_fb or (not _uf_global and not _uf_profile)):
-            if _uf_global:
-                db.add_target_feedback(manual_fb, product_summary="수동 입력", profile_id=None)
-            if _uf_profile and _active_pid:
-                db.add_target_feedback(manual_fb, product_summary="수동 입력", profile_id=_active_pid)
+        _uf_c1, _uf_c2, _uf_c3 = st.columns([1, 1, 1])
+        with _uf_c1:
+            _uf_global = st.checkbox("글로벌 (모든 프로필)", value=True, key="uf_scope_global")
+        with _uf_c2:
+            _uf_profile = st.checkbox(
+                f"프로필 전용 ({_active_profile_name})" if _active_profile_name else "프로필 전용 (미선택)",
+                value=bool(_active_pid),
+                key="uf_scope_profile",
+                disabled=not _active_pid,
+            )
+        with _uf_c3:
+            if st.button("추가", key="add_fb_unified", disabled=not manual_fb or (not _uf_global and not _uf_profile)):
+                if _uf_global:
+                    db.add_target_feedback(manual_fb, product_summary="수동 입력", profile_id=None)
+                if _uf_profile and _active_pid:
+                    db.add_target_feedback(manual_fb, product_summary="수동 입력", profile_id=_active_pid)
+                st.rerun()
+
+
+
+    elif target_mode == "researcher":
+        st.caption("제품 설명을 입력하면 AI가 적합한 학술 연구자/교수를 추천합니다.")
+
+        if "ai_researcher_result" not in st.session_state:
+            st.session_state.ai_researcher_result = None
+        if "ai_researcher_parsed" not in st.session_state:
+            st.session_state.ai_researcher_parsed = None
+        if "ai_researcher_verification" not in st.session_state:
+            st.session_state.ai_researcher_verification = None
+        if "ai_researcher_verdicts" not in st.session_state:
+            st.session_state.ai_researcher_verdicts = {}
+
+        # ── Input Section ─────────────────────────────
+        st.subheader("제품/서비스 정보")
+
+        _active_pid = st.session_state.get("active_profile_id")
+        _run_profile_id = _active_pid
+
+        # Build campaign context if profile active
+        _r_campaign_ctx = ""
+        if _active_pid:
+            _r_campaign_ctx = build_campaign_context(st.session_state.get("active_profile"))
+            if _r_campaign_ctx:
+                with st.expander("활성 프로필 컨텍스트 (자동 포함)", expanded=False):
+                    st.text(_r_campaign_ctx[:500])
+
+        researcher_product_desc = st.text_area(
+            "제품/서비스 설명 (필수)",
+            height=150,
+            placeholder="예: CNS dataset + 연구 목적을 입력하면 임상시험 시뮬레이션과 바이오마커 리포트를 생성하는 AI co-scientist",
+            key="researcher_product_desc",
+        )
+
+        _rc1, _rc2 = st.columns(2)
+        with _rc1:
+            researcher_areas = st.text_input(
+                "타겟 연구 분야 (선택)",
+                placeholder="예: 신경과학, 정신의학, 뇌전증, 수면 연구",
+                key="researcher_areas",
+            )
+        with _rc2:
+            researcher_region = st.text_input(
+                "지역 제한 (선택)",
+                placeholder="예: Japan, US, Europe",
+                key="researcher_region",
+            )
+
+        # ── Execute Button ────────────────────────────
+        if st.button("🤖 AI 연구자 추천 실행", type="primary",
+                      disabled=not researcher_product_desc or st.session_state.get("agent_running")):
+            full_desc = researcher_product_desc
+            if _r_campaign_ctx:
+                full_desc = f"{_r_campaign_ctx}\n\n{researcher_product_desc}"
+            if researcher_areas:
+                full_desc += f"\n\n타겟 연구 분야: {researcher_areas}"
+            region_line = f"\n지역 제한: {researcher_region}" if researcher_region else ""
+
+            agent_request = (
+                f"아래 제품에 적합한 학술 연구자/교수를 찾아줘.\n\n"
+                f"## 제품 설명\n{full_desc}{region_line}\n\n"
+                f"다양한 검색어로 웹 리서치를 수행한 뒤, "
+                f"결과를 Tier 1/Tier 2로 분류하고 JSON으로 출력해줘."
+            )
+
+            st.session_state._pending_researcher_agent = {
+                "request": agent_request,
+                "feedback": db.get_combined_feedback_text(_run_profile_id),
+            }
+            st.session_state.agent_running = True
             st.rerun()
 
+        # Phase 2: execute pending researcher agent
+        if st.session_state.get("_pending_researcher_agent"):
+            # Overlay
+            st.markdown(
+                '<div style="position:fixed;top:0;left:0;width:100vw;height:100vh;'
+                'background:rgba(0,0,0,0.55);z-index:9999;display:flex;'
+                'align-items:center;justify-content:center;">'
+                '<div style="background:#1e1e2e;padding:2rem 3rem;border-radius:12px;'
+                'color:white;text-align:center;font-size:1.2rem;">'
+                '🔬 AI 연구자 추천 실행 중...<br>'
+                '<small style="color:#aaa;">웹 검색 → 분석 → 연구자 추천 (1~3분 소요)</small>'
+                '</div></div>',
+                unsafe_allow_html=True,
+            )
+
+            _task = st.session_state.pop("_pending_researcher_agent")
+            try:
+                from agent import ResearcherFinderAgent
+                tracker = AgentProgressTracker("agent1")
+                agent = ResearcherFinderAgent(
+                    extra_feedback=_task["feedback"],
+                    on_tool_call=tracker.on_tool_call,
+                    on_tool_result=tracker.on_tool_result,
+                    on_text=tracker.on_text,
+                )
+                agent.run(_task["request"])
+                result_json = agent.result_json
+                if result_json:
+                    st.session_state.ai_researcher_result = result_json
+                    st.session_state.ai_researcher_parsed = None
+                    st.session_state.ai_researcher_verification = None
+                    st.session_state.ai_researcher_verdicts = {}
+
+                tracker.complete("연구자 탐색 완료! 근거 검증 시작...")
+
+                # Auto-verify immediately after agent completes
+                if st.session_state.ai_researcher_result:
+                    _auto_verify_researchers(
+                        st.session_state.ai_researcher_result,
+                        feedback=_task["feedback"],
+                    )
+            except Exception as e:
+                logger.error(f"ResearcherFinderAgent failed: {e}")
+                st.error(f"AI 연구자 추천 실패: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+            finally:
+                st.session_state.agent_running = False
+            st.rerun()
+
+        # ── Results Display ───────────────────────────
+        if st.session_state.ai_researcher_result:
+            # Parse JSON from result
+            if st.session_state.ai_researcher_parsed is None:
+                _raw = st.session_state.ai_researcher_result
+                try:
+                    _parsed = json.loads(_raw)
+                except (json.JSONDecodeError, TypeError):
+                    # Try to extract JSON from markdown code block
+                    import re
+                    _m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", _raw, re.DOTALL)
+                    if _m:
+                        try:
+                            _parsed = json.loads(_m.group(1))
+                        except json.JSONDecodeError:
+                            _parsed = None
+                    else:
+                        _parsed = None
+                st.session_state.ai_researcher_parsed = _parsed
+
+            parsed = st.session_state.ai_researcher_parsed
+
+            if parsed:
+                st.subheader("추천 결과")
+                st.success(f"**{parsed.get('product_summary', '')}**")
+
+                _analysis = parsed.get("analysis", "")
+                if _analysis:
+                    with st.expander("제품-연구 연결 분석", expanded=False):
+                        st.markdown(_analysis)
+
+                tier1 = parsed.get("tier1_researchers", [])
+                tier2 = parsed.get("tier2_researchers", [])
+
+                # Build verification + verdict lookups
+                _r_vmap = {}
+                if st.session_state.ai_researcher_verification:
+                    for rv in st.session_state.ai_researcher_verification:
+                        _r_vmap[rv.get("name", "")] = rv
+                _r_verdict_map = st.session_state.get("ai_researcher_verdicts", {})
+
+                _tier_tab = st.radio(
+                    "결과 보기",
+                    ["tier1", "tier2", "areas"],
+                    format_func=lambda x: {
+                        "tier1": f"Tier 1 ({len(tier1)}명)",
+                        "tier2": f"Tier 2 ({len(tier2)}명)",
+                        "areas": "연구 분야",
+                    }[x],
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    key="researcher_tier_tab",
+                )
+
+                if _tier_tab == "tier1":
+                    if tier1:
+                        for idx, r in enumerate(tier1):
+                            # Merge verification data into card
+                            r_name = r.get("name", "")
+                            r_with_v = {**r}
+                            if r_name in _r_vmap:
+                                r_with_v["verification"] = _r_vmap[r_name].get("verification", {})
+                            col_card, col_actions = st.columns([5, 1])
+                            with col_card:
+                                _render_researcher_card(r_with_v, _r_verdict_map.get(r_name))
+                            with col_actions:
+                                st.write("")
+                                if st.button("→ T2", key=f"r_t1to2_{idx}", help="Tier 2로 이동"):
+                                    researcher = tier1.pop(idx)
+                                    tier2.append(researcher)
+                                    st.rerun()
+                                if st.button("삭제", key=f"r_del_t1_{idx}", help="목록에서 제거"):
+                                    tier1.pop(idx)
+                                    st.rerun()
+                    else:
+                        st.info("Tier 1 연구자 없음")
+
+                elif _tier_tab == "tier2":
+                    if tier2:
+                        for idx, r in enumerate(tier2):
+                            r_name = r.get("name", "")
+                            r_with_v = {**r}
+                            if r_name in _r_vmap:
+                                r_with_v["verification"] = _r_vmap[r_name].get("verification", {})
+                            col_card, col_actions = st.columns([5, 1])
+                            with col_card:
+                                _render_researcher_card(r_with_v, _r_verdict_map.get(r_name))
+                            with col_actions:
+                                st.write("")
+                                if st.button("→ T1", key=f"r_t2to1_{idx}", help="Tier 1으로 이동"):
+                                    researcher = tier2.pop(idx)
+                                    tier1.append(researcher)
+                                    st.rerun()
+                                if st.button("삭제", key=f"r_del_t2_{idx}", help="목록에서 제거"):
+                                    tier2.pop(idx)
+                                    st.rerun()
+                    else:
+                        st.info("Tier 2 연구자 없음")
+
+                else:  # areas
+                    areas = parsed.get("target_research_areas", [])
+                    if areas:
+                        st.markdown("**타겟 연구 분야:**")
+                        for a in areas:
+                            st.markdown(f"- {a}")
+                    else:
+                        st.info("연구 분야 정보 없음")
+
+                # ── Verification Summary ──────────────
+                if _r_verdict_map:
+                    st.divider()
+                    st.subheader("근거 교차검증 결과")
+                    st.caption("외부 데이터(웹 + PubMed + ClinicalTrials) 수집 후 Claude가 AI 근거와 비교 분석")
+
+                    total_v = len(_r_verdict_map)
+                    confirmed = sum(1 for v in _r_verdict_map.values() if v.get("verdict") == "confirmed")
+                    v_partial = sum(1 for v in _r_verdict_map.values() if v.get("verdict") == "partial")
+                    unverified = sum(1 for v in _r_verdict_map.values() if v.get("verdict") == "unverified")
+                    wrong = sum(1 for v in _r_verdict_map.values() if v.get("verdict") == "wrong")
+
+                    vcol1, vcol2, vcol3, vcol4 = st.columns(4)
+                    vcol1.metric("✅ 확인됨", confirmed)
+                    vcol2.metric("⚠️ 일부 확인", v_partial)
+                    vcol3.metric("❓ 미검증", unverified)
+                    vcol4.metric("❌ 불일치", wrong)
+
+                # ── Export Results as Markdown ─────────
+                st.divider()
+                st.subheader("결과 내보내기")
+
+                def _build_researcher_export_md():
+                    lines = [f"# 타겟 연구자 추천 결과\n"]
+                    lines.append(f"**제품 요약:** {parsed.get('product_summary', '')}\n")
+                    _exp_analysis = parsed.get("analysis", "")
+                    if _exp_analysis:
+                        lines.append(f"## 분석\n{_exp_analysis}\n")
+
+                    for tier_label, tier_list in [
+                        ("Tier 1 (핵심 타겟)", tier1),
+                        ("Tier 2 (잠재적 타겟)", tier2),
+                    ]:
+                        lines.append(f"## {tier_label} — {len(tier_list)}명\n")
+                        for i, r in enumerate(tier_list, 1):
+                            r_name = r.get("name", "")
+                            r_inst = r.get("institution", "")
+                            r_dept = r.get("department", "")
+                            r_title = r.get("title", "")
+                            header = f"### {i}. {r_name}"
+                            if r_title:
+                                header += f" — {r_title}"
+                            if r_inst:
+                                header += f", {r_inst}"
+                                if r_dept:
+                                    header += f" ({r_dept})"
+                            lines.append(header)
+                            if r.get("research_area"):
+                                lines.append(f"- **연구 분야:** {r['research_area']}")
+                            if r.get("key_publications"):
+                                lines.append(f"- **주요 연구:** {r['key_publications']}")
+                            if r.get("reason"):
+                                lines.append(f"- **요약:** {r['reason']}")
+                            if r.get("evidence"):
+                                lines.append(f"- **근거:** {r['evidence']}")
+                            if r.get("tier_reason"):
+                                lines.append(f"- **Tier 산정:** {r['tier_reason']}")
+                            if r.get("contact_clues"):
+                                lines.append(f"- **연락처 단서:** {r['contact_clues']}")
+                            # Add verdict if available
+                            _v = _r_verdict_map.get(r_name, {})
+                            if _v:
+                                _emoji = {"confirmed": "✅", "partial": "⚠️", "unverified": "❓", "wrong": "❌"}.get(_v.get("verdict", ""), "")
+                                lines.append(f"- **교차검증:** {_emoji} {_v.get('verdict', '')} — {_v.get('explanation', '')}")
+                            lines.append("")
+
+                    _areas = parsed.get("target_research_areas", [])
+                    if _areas:
+                        lines.append("## 타겟 연구 분야\n")
+                        for a in _areas:
+                            lines.append(f"- {a}")
+                        lines.append("")
+
+                    return "\n".join(lines)
+
+                _export_md = _build_researcher_export_md()
+                st.download_button(
+                    "📥 Markdown으로 내보내기",
+                    data=_export_md,
+                    file_name="target_researchers_result.md",
+                    mime="text/markdown",
+                    key="export_researcher_md",
+                )
+
+                # ── Feedback Section ──────────────────────
+                st.divider()
+                st.subheader("피드백 & 재추천")
+                st.caption("피드백을 입력하면 기존 결과 + 피드백을 반영하여 재추천합니다. (타겟 피드백 DB 공유)")
+
+                _r_feedback_text = st.text_area(
+                    "피드백 입력",
+                    placeholder="예: 일본 대학 위주로 추천해줘, CNS 임상시험 PI 위주로",
+                    key="researcher_feedback_text",
+                    height=80,
+                )
+
+                if st.button("🔄 피드백 반영 재추천", type="primary",
+                             disabled=not _r_feedback_text or st.session_state.get("agent_running"),
+                             key="researcher_re_recommend"):
+                    # Build re-recommendation request with feedback
+                    full_desc = researcher_product_desc or ""
+                    if _r_campaign_ctx:
+                        full_desc = f"{_r_campaign_ctx}\n\n{full_desc}"
+                    if researcher_areas:
+                        full_desc += f"\n\n타겟 연구 분야: {researcher_areas}"
+                    region_line = f"\n지역 제한: {researcher_region}" if researcher_region else ""
+
+                    prev_result = st.session_state.ai_researcher_result
+                    agent_request = (
+                        f"아래 제품에 적합한 학술 연구자/교수를 찾아줘.\n\n"
+                        f"## 제품 설명\n{full_desc}{region_line}\n\n"
+                        f"## 이전 추천 결과\n{prev_result}\n\n"
+                        f"## 사용자 피드백 (반드시 반영)\n{_r_feedback_text}\n\n"
+                        f"위 피드백을 반영하여 결과를 수정해줘."
+                    )
+
+                    # Save feedback to DB
+                    db.add_target_feedback(
+                        _r_feedback_text,
+                        product_summary="연구자 추천 피드백",
+                        profile_id=_run_profile_id,
+                    )
+
+                    st.session_state._pending_researcher_agent = {
+                        "request": agent_request,
+                        "feedback": db.get_combined_feedback_text(_run_profile_id),
+                    }
+                    st.session_state.agent_running = True
+                    st.rerun()
+
+                # ── Save as Preset ────────────────────────
+                st.divider()
+                st.subheader("프리셋으로 저장")
+                st.caption("추천 결과를 프리셋으로 저장하면 '컨택 서칭' 페이지에서 바로 사용할 수 있습니다.")
+
+                rec = parsed.get("recommended_search_params", {})
+                tier1_names = [f"{r['name']} ({r.get('institution', '')})" for r in tier1]
+                tier2_names = [f"{r['name']} ({r.get('institution', '')})" for r in tier2]
+                all_institutions = list(set(
+                    r.get("institution", "") for r in tier1 + tier2 if r.get("institution")
+                ))
+                all_areas = parsed.get("target_research_areas", [])
+
+                save_scope = st.radio(
+                    "저장할 범위",
+                    ["Tier 1 + Tier 2 전체", "Tier 1만", "Tier 2만", "Tier 1 / Tier 2 각각 (2개 프리셋)"],
+                    horizontal=True,
+                    key="researcher_save_scope",
+                )
+
+                if save_scope == "Tier 1 / Tier 2 각각 (2개 프리셋)":
+                    _save_groups = [("_T1", tier1_names), ("_T2", tier2_names)]
+                elif save_scope == "Tier 2만":
+                    _save_groups = [("", tier2_names)]
+                elif save_scope == "Tier 1만":
+                    _save_groups = [("", tier1_names)]
+                else:
+                    _save_groups = [("", tier1_names + tier2_names)]
+
+                # Preview
+                with st.expander("저장될 프리셋 내용 미리보기", expanded=False):
+                    st.markdown(f"**연구 분야:** {', '.join(all_areas)}")
+                    st.markdown(f"**기관:** {', '.join(all_institutions[:10])}")
+                    st.markdown(f"**검색 키워드:** {rec.get('research_keywords', '')}")
+
+                if save_scope == "Tier 1 / Tier 2 각각 (2개 프리셋)":
+                    _nc1, _nc2 = st.columns(2)
+                    with _nc1:
+                        r_preset_name_t1 = st.text_input(
+                            "Tier 1 프리셋 이름",
+                            value=f"연구자_{datetime.now().strftime('%y%m%d')}_T1",
+                            key="r_preset_name_t1",
+                        )
+                    with _nc2:
+                        r_preset_name_t2 = st.text_input(
+                            "Tier 2 프리셋 이름",
+                            value=f"연구자_{datetime.now().strftime('%y%m%d')}_T2",
+                            key="r_preset_name_t2",
+                        )
+                    _save_groups = [(r_preset_name_t1, tier1_names), (r_preset_name_t2, tier2_names)]
+                    _r_can_save = bool(r_preset_name_t1 and r_preset_name_t2)
+                else:
+                    r_preset_name = st.text_input(
+                        "프리셋 이름",
+                        value=f"연구자_{datetime.now().strftime('%y%m%d')}",
+                        key="r_preset_name",
+                    )
+                    _save_groups = [(r_preset_name, c) for _, c in _save_groups]
+                    _r_can_save = bool(r_preset_name)
+
+                if st.button("💾 프리셋 저장 → 컨택 서칭", type="primary",
+                             disabled=not _r_can_save, key="save_researcher_preset"):
+                    for _name, _researchers in _save_groups:
+                        if not _researchers:
+                            continue
+                        db.save_preset(
+                            name=_name,
+                            industry=", ".join(all_areas),
+                            titles="Professor, Associate Professor, PI, Lab Director",
+                            locations=researcher_region or "",
+                            companies=", ".join(_researchers),
+                            keywords=rec.get("research_keywords", ""),
+                            max_results=100,
+                            feedback_hash=_get_feedback_hash(),
+                            product_description=researcher_product_desc or "",
+                            target_hint=researcher_areas or "",
+                            target_region=researcher_region or "",
+                            preset_type="researcher",
+                            institutions=", ".join(all_institutions),
+                            research_areas=", ".join(all_areas),
+                        )
+                    _saved = ", ".join(f"'{n}'" for n, r in _save_groups if r)
+                    st.session_state.ai_researcher_result = None
+                    st.session_state.ai_researcher_parsed = None
+                    st.session_state.ai_researcher_verification = None
+                    st.session_state.ai_researcher_verdicts = {}
+                    st.session_state.active_page = "🔍 컨택 서칭"
+                    st.session_state.contact_search_mode = "manual"
+                    st.session_state.prospect_step = "search"
+                    st.success(f"프리셋 {_saved} 저장 완료! 컨택 서칭으로 이동합니다.")
+                    st.rerun()
+
+            else:
+                # JSON parsing failed — show raw result
+                st.warning("AI 결과를 JSON으로 파싱하지 못했습니다. 원본 텍스트:")
+                st.text(st.session_state.ai_researcher_result[:3000])
+
+            # ── Reset button ──────────────────────────
+            st.divider()
+            if st.button("🗑️ 결과 초기화", key="reset_researcher"):
+                st.session_state.ai_researcher_result = None
+                st.session_state.ai_researcher_parsed = None
+                st.session_state.ai_researcher_verification = None
+                st.session_state.ai_researcher_verdicts = {}
+                st.rerun()
 
 # ══════════════════════════════════════════════════════════
 # PAGE 1: Contact Search (컨택 서칭)
@@ -1603,11 +2304,13 @@ elif page == "🔍 컨택 서칭":
             saved_presets = db.get_presets()
             if saved_presets:
                 current_fb_hash = _get_feedback_hash()
-                preset_names = [sp["name"] for sp in saved_presets]
-                selected_preset_name = st.selectbox(
+                _ptype_icon = lambda sp: "🎓" if sp.get("preset_type") == "researcher" else "🏢"
+                preset_names = [f"{_ptype_icon(sp)} {sp['name']}" for sp in saved_presets]
+                selected_preset_label = st.selectbox(
                     "프리셋 선택", preset_names, key="a2_preset_select"
                 )
-                sel = next(sp for sp in saved_presets if sp["name"] == selected_preset_name)
+                _sel_idx = preset_names.index(selected_preset_label)
+                sel = saved_presets[_sel_idx]
 
                 # Warn if feedback changed since preset was saved
                 if sel.get("feedback_hash") and sel["feedback_hash"] != current_fb_hash:
@@ -1617,11 +2320,16 @@ elif page == "🔍 컨택 서칭":
                     )
 
                 # Show preset summary
+                _is_researcher_preset = sel.get("preset_type") == "researcher"
                 info_parts = []
                 if sel.get("companies"):
-                    info_parts.append(f"**회사**: {sel['companies']}")
+                    _label = "연구자" if _is_researcher_preset else "회사"
+                    info_parts.append(f"**{_label}**: {sel['companies']}")
                 if sel.get("industry"):
-                    info_parts.append(f"**산업**: {sel['industry']}")
+                    _label = "연구 분야" if _is_researcher_preset else "산업"
+                    info_parts.append(f"**{_label}**: {sel['industry']}")
+                if sel.get("institutions") and _is_researcher_preset:
+                    info_parts.append(f"**기관**: {sel['institutions']}")
                 if sel.get("titles"):
                     info_parts.append(f"**직함**: {sel['titles']}")
                 if sel.get("locations"):
@@ -1635,7 +2343,10 @@ elif page == "🔍 컨택 서칭":
                 companies_str = sel.get("companies") or ""
                 if companies_str.strip():
                     companies_list = [c.strip() for c in companies_str.split(",") if c.strip()]
-                    parts = [f"다음 {len(companies_list)}개 회사에서 이메일을 찾아줘 (전부 빠짐없이 처리할 것): {', '.join(companies_list)}"]
+                    if _is_researcher_preset:
+                        parts = [f"다음 {len(companies_list)}명의 연구자 이메일을 찾아줘 (전부 빠짐없이 처리할 것): {', '.join(companies_list)}"]
+                    else:
+                        parts = [f"다음 {len(companies_list)}개 회사에서 이메일을 찾아줘 (전부 빠짐없이 처리할 것): {', '.join(companies_list)}"]
                     if sel.get("titles"):
                         parts.append(f"타겟 직함: {sel['titles']}")
                     if sel.get("locations"):
@@ -1643,10 +2354,15 @@ elif page == "🔍 컨택 서칭":
                     if sel.get("keywords"):
                         parts.append(f"키워드: {sel['keywords']}")
                     if sel.get("industry"):
-                        parts.append(f"산업: {sel['industry']}")
+                        _label = "연구 분야" if _is_researcher_preset else "산업"
+                        parts.append(f"{_label}: {sel['industry']}")
+                    if _is_researcher_preset:
+                        if sel.get("institutions"):
+                            parts.append(f"참고 기관: {sel['institutions']}")
+                        parts.append("이 사람들은 학술 연구자입니다. 대학/연구기관 도메인에서 이메일을 찾아주세요.")
                     agent2_request = "\n".join(parts)
                 else:
-                    st.warning("이 프리셋에 회사 목록이 없습니다. 회사가 포함된 프리셋을 선택하거나 '직접 입력' 탭을 사용하세요.")
+                    st.warning("이 프리셋에 대상 목록이 없습니다. 대상이 포함된 프리셋을 선택하거나 '직접 입력' 탭을 사용하세요.")
             else:
                 st.info("저장된 프리셋이 없습니다. '🎯 타겟 발굴' 페이지에서 AI 추천 → 프리셋 저장을 먼저 해주세요.")
 
@@ -1720,10 +2436,26 @@ elif page == "🔍 컨택 서칭":
         # ── Display results ───────────────────────────
         if st.session_state.agent2_result:
             result = st.session_state.agent2_result
-            contacts = result.get("contacts", [])
+            contacts_raw = result.get("contacts", [])
             summary = result.get("search_summary", {})
 
-            st.success(f"✅ {len(contacts)}명의 연락처 발견")
+            # Deduplicate by (email, company) — matches DB UNIQUE constraint
+            seen = set()
+            contacts = []
+            for c in contacts_raw:
+                email = (c.get("email") or "").strip().lower()
+                company = (c.get("company") or "").strip().lower()
+                name = (c.get("contact_name") or "").strip().lower()
+                key = (email, company) if email else (name, company)
+                if key not in seen:
+                    seen.add(key)
+                    contacts.append(c)
+
+            dupes_removed = len(contacts_raw) - len(contacts)
+            msg = f"✅ {len(contacts)}명의 연락처 발견"
+            if dupes_removed > 0:
+                msg += f" (중복 {dupes_removed}건 제거)"
+            st.success(msg)
 
             # Metrics
             m1, m2, m3, m4 = st.columns(4)
@@ -1737,7 +2469,7 @@ elif page == "🔍 컨택 서칭":
             if contacts:
                 import pandas as pd
                 df = pd.DataFrame(contacts)
-                display_cols = [c for c in ["contact_name", "email", "email_confidence", "company", "title", "fit_score", "source", "location"] if c in df.columns]
+                display_cols = [c for c in ["contact_name", "email", "email_confidence", "company", "title", "source", "location"] if c in df.columns]
                 st.dataframe(df[display_cols], use_container_width=True, height=400)
 
                 # Export
@@ -1755,7 +2487,7 @@ elif page == "🔍 컨택 서칭":
                     if st.button("📧 콜드메일 캠페인으로 보내기"):
                         st.session_state.csv_data = csv_data
                         st.session_state.a3_from_agent2 = st.session_state.get("agent2_search_id")
-                        st.session_state.active_page = "✉️ 콜드메일"
+                        st.session_state.active_page = "📝 콜드메일"
                         st.rerun()
 
         # Agent activity log (full)
@@ -1803,7 +2535,9 @@ elif page == "🔍 컨택 서칭":
         saved_presets = db.get_presets()
         SAVED_PRESETS = {}
         for sp in saved_presets:
-            SAVED_PRESETS[sp["name"]] = {
+            _icon = "🎓" if sp.get("preset_type") == "researcher" else "🏢"
+            _display_name = f"{_icon} {sp['name']}"
+            SAVED_PRESETS[_display_name] = {
                 "id": sp["id"],
                 "industry": sp.get("industry") or "",
                 "titles": sp.get("titles") or "",
@@ -2297,10 +3031,10 @@ elif page == "🔍 컨택 서칭":
 
             df = pd.DataFrame(prospects)
             display_cols = ["contact_name", "company", "title", "email", "email_confidence",
-                            "fit_score", "fit_reason", "location"]
+                            "location"]
             display_cols = [c for c in display_cols if c in df.columns]
             st.dataframe(
-                df[display_cols].sort_values("fit_score", ascending=False),
+                df[display_cols],
                 width="stretch",
                 hide_index=True,
             )
@@ -2365,9 +3099,8 @@ elif page == "🔍 컨택 서칭":
                     vcols[3].metric("Unknown", v_counts.get("unknown", 0) + v_counts.get("pending", 0))
 
         st.divider()
-        min_score = st.slider("최소 Fit Score", 0.0, 10.0, 5.0, step=0.5)
 
-        prospects = db.get_prospects(search_id=search_id, min_fit_score=min_score) if search_id else []
+        prospects = db.get_prospects(search_id=search_id) if search_id else []
         prospects_with_email = [p for p in prospects if p.get("email")
                                 and p.get("verification_status") != "undeliverable"]
 
@@ -2377,7 +3110,7 @@ elif page == "🔍 컨택 서칭":
             import pandas as pd
 
             df = pd.DataFrame(prospects_with_email)
-            display_cols = ["contact_name", "email", "company", "title", "fit_score", "email_confidence", "verification_status"]
+            display_cols = ["contact_name", "email", "company", "title", "email_confidence", "verification_status"]
             display_cols = [c for c in display_cols if c in df.columns]
             st.dataframe(df[display_cols], width="stretch", hide_index=True)
 
@@ -2389,7 +3122,7 @@ elif page == "🔍 컨택 서칭":
                 st.session_state.prospect_step = "enrich"
                 st.rerun()
         with col2:
-            csv_content = db.export_prospects_to_csv(search_id, min_fit_score=min_score) if search_id else ""
+            csv_content = db.export_prospects_to_csv(search_id) if search_id else ""
             if csv_content.strip():
                 today = datetime.now().strftime("%y%m%d")
                 st.download_button(
@@ -2417,7 +3150,7 @@ elif page == "📝 콜드메일":
 
     # ── Mode selector ─────────────────────────────────
     if "coldmail_mode" not in st.session_state:
-        st.session_state.coldmail_mode = "manual"
+        st.session_state.coldmail_mode = "agent"
     if "agent3_log" not in st.session_state:
         st.session_state.agent3_log = []
     if "agent3_drafts" not in st.session_state:
@@ -2465,19 +3198,6 @@ elif page == "📝 콜드메일":
         a3col1, a3col2 = st.columns(2)
 
         with a3col1:
-            # Product selection
-            products = load_products()
-            if products:
-                a3_product_options = {f"{num}번: {name}": num for num, name in products.items()}
-                a3_selected = st.selectbox(
-                    "제품 선택",
-                    list(a3_product_options.keys()),
-                    key="a3_product",
-                )
-                a3_product_number = a3_product_options[a3_selected]
-            else:
-                a3_product_number = st.number_input("제품 번호", min_value=1, max_value=10, value=1, key="a3_pnum")
-
             # Language
             a3_lang = st.selectbox("언어", ["en (영어)", "ja (일본어)"], index=0, key="a3_lang")
             a3_language_code = a3_lang.split(" ")[0]
@@ -2524,12 +3244,34 @@ elif page == "📝 콜드메일":
         # Auto-detect: Agent 2 → Agent 3 handoff
         _from_agent2_sid = st.session_state.get("a3_from_agent2")
 
-        if _from_agent2_sid:
-            # Agent 2에서 직접 넘어온 경우 — DB search_id 자동 사용
+        # Agent 2 → Agent 3 handoff: csv_data가 있으면 우선 사용
+        _a2_csv = st.session_state.get("csv_data", "")
+        if _from_agent2_sid and _a2_csv and _a2_csv.strip():
+            # CSV 데이터에서 로드 (DB search_id 제한 없이 전체 결과)
+            _a2_rows = parse_csv_string(_a2_csv)
+            _a2_with_email = [r for r in _a2_rows if r.get("email")]
+            st.success(
+                f"Agent 2 결과 자동 연결됨: "
+                f"총 {len(_a2_rows)}명, 이메일 {len(_a2_with_email)}명"
+            )
+            a3_csv_text = _a2_csv
+
+            if _a2_with_email:
+                import pandas as pd
+                df = pd.DataFrame(_a2_with_email)
+                display_cols = [c for c in ["contact_name", "email", "company", "title"] if c in df.columns]
+                st.dataframe(df[display_cols], use_container_width=True, height=300, hide_index=True)
+
+            if st.button("다른 소스 사용하기"):
+                st.session_state.a3_from_agent2 = None
+                st.session_state.csv_data = ""
+                st.rerun()
+        elif _from_agent2_sid:
+            # CSV 없으면 DB fallback
             _a2_prospects = db.get_prospects(search_id=_from_agent2_sid)
             _a2_with_email = [p for p in _a2_prospects if p.get("email")]
             st.success(
-                f"Agent 2 결과 자동 연결됨 (search_id={_from_agent2_sid}): "
+                f"Agent 2 결과 (search_id={_from_agent2_sid}): "
                 f"총 {len(_a2_prospects)}명, 이메일 {len(_a2_with_email)}명"
             )
             a3_search_id = _from_agent2_sid
@@ -2537,7 +3279,7 @@ elif page == "📝 콜드메일":
             if _a2_with_email:
                 import pandas as pd
                 df = pd.DataFrame(_a2_with_email)
-                display_cols = [c for c in ["contact_name", "email", "company", "title", "fit_score"] if c in df.columns]
+                display_cols = [c for c in ["contact_name", "email", "company", "title"] if c in df.columns]
                 st.dataframe(df[display_cols], use_container_width=True, height=300, hide_index=True)
 
             if st.button("다른 소스 사용하기"):
@@ -2590,7 +3332,7 @@ elif page == "📝 콜드메일":
                     if email_prospects:
                         import pandas as pd
                         df = pd.DataFrame(email_prospects)
-                        display_cols = [c for c in ["contact_name", "email", "company", "title", "fit_score"] if c in df.columns]
+                        display_cols = [c for c in ["contact_name", "email", "company", "title"] if c in df.columns]
                         st.dataframe(df[display_cols], width="stretch", hide_index=True)
                 else:
                     st.info("완료된 컨택 검색이 없습니다. Agent 2 또는 수동 검색을 먼저 실행하세요.")
@@ -2629,13 +3371,13 @@ elif page == "📝 콜드메일":
             # Build user request
             if a3_search_id:
                 a3_user_request = (
-                    f"{a3_product_number}번 제품으로 콜드메일 작성해줘.\n"
+                    f"콜드메일 작성해줘.\n"
                     f"연락처는 DB search_id={a3_search_id}에서 로드해줘.\n"
                     f"언어: {a3_language_code}\n"
                 )
             else:
                 a3_user_request = (
-                    f"{a3_product_number}번 제품으로 콜드메일 작성해줘.\n"
+                    f"콜드메일 작성해줘.\n"
                     f"언어: {a3_language_code}\n"
                     f"\n## CSV 데이터\n```\n{a3_csv_text}\n```"
                 )
@@ -2672,12 +3414,12 @@ elif page == "📝 콜드메일":
             # Phase 1: save params and rerun to show overlay
             st.session_state._pending_agent3 = {
                 "request": a3_user_request,
-                "product_number": a3_product_number,
                 "language": a3_language_code,
                 "cta_type": a3_cta_text,
                 "extra_instructions": a3_full_instructions,
                 "campaign_context": _a3_ctx,
                 "sender_profile_md": _sender_md,
+                "profile_id": st.session_state.get("active_profile_id"),
                 "total_items": max(_a3_total, 1),
             }
             st.session_state.agent_running = True
@@ -2691,12 +3433,12 @@ elif page == "📝 콜드메일":
                 from agent import ColdMailAgent
 
                 agent = ColdMailAgent(
-                    product_number=_task["product_number"],
                     language=_task["language"],
                     cta_type=_task["cta_type"],
                     extra_instructions=_task["extra_instructions"],
                     campaign_context=_task["campaign_context"],
                     sender_profile_md=_task["sender_profile_md"],
+                    profile_id=_task.get("profile_id"),
                     on_tool_call=tracker.on_tool_call,
                     on_tool_result=tracker.on_tool_result,
                     on_text=tracker.on_text,
@@ -2763,7 +3505,7 @@ elif page == "📝 콜드메일":
                         try:
                             from agent import ColdMailAgent
                             # Create a minimal agent just for upload
-                            agent = ColdMailAgent(product_number=a3_product_number, language=a3_language_code)
+                            agent = ColdMailAgent(language=a3_language_code)
                             agent._campaign_id = st.session_state.agent3_campaign_id
                             agent._csv_content = st.session_state.agent3_csv
                             result = agent._upload_sheets()
@@ -2791,6 +3533,61 @@ elif page == "📝 콜드메일":
                     "text/plain",
                     key="a3_log_download",
                 )
+
+        # ── Email Writing Feedback ────────────────────────
+        st.divider()
+        with st.expander("📝 메일 작성 피드백 관리", expanded=False):
+            # Build profile list for selector
+            _all_profiles = db.get_campaign_profiles()
+            _profile_options = {"🌐 글로벌 (모든 프로필 공통)": None}
+            for p in _all_profiles:
+                _profile_options[f"📋 {p['name']}"] = p["id"]
+
+            # Show existing feedback — global + all profiles
+            _global_fb = db.get_email_feedback(profile_id=None)
+            if _global_fb:
+                st.markdown("**🌐 글로벌 피드백** (모든 프로필 공통)")
+                for fb in _global_fb:
+                    fcol1, fcol2 = st.columns([9, 1])
+                    fcol1.markdown(f"- `{fb['created_at'][:16]}` {fb['feedback']}")
+                    if fcol2.button("🗑️", key=f"del_efb_g_{fb['id']}"):
+                        db.delete_email_feedback(fb["id"])
+                        st.rerun()
+
+            for p in _all_profiles:
+                _pfb = db.get_email_feedback(profile_id=p["id"])
+                if _pfb:
+                    st.markdown(f"**📋 {p['name']}**")
+                    for fb in _pfb:
+                        fcol1, fcol2 = st.columns([9, 1])
+                        fcol1.markdown(f"- `{fb['created_at'][:16]}` {fb['feedback']}")
+                        if fcol2.button("🗑️", key=f"del_efb_p_{fb['id']}"):
+                            db.delete_email_feedback(fb["id"])
+                            st.rerun()
+
+            if not _global_fb and not any(db.get_email_feedback(profile_id=p["id"]) for p in _all_profiles):
+                st.caption("저장된 피드백이 없습니다.")
+
+            # Add new feedback
+            st.markdown("---")
+            _efb_target = st.selectbox(
+                "피드백 저장 대상",
+                list(_profile_options.keys()),
+                key="efb_target_profile",
+            )
+            _efb_target_pid = _profile_options[_efb_target]
+
+            _new_efb = st.text_area(
+                "새 피드백 입력",
+                placeholder="예: Subject에서 「の」 탈락 금지, 본문 5줄 이내로 등",
+                height=80,
+                key="new_email_feedback",
+            )
+            if st.button("💾 피드백 저장", disabled=not _new_efb):
+                db.add_email_feedback(_new_efb, profile_id=_efb_target_pid)
+                _saved_label = _efb_target.replace("🌐 ", "").replace("📋 ", "")
+                st.success(f"'{_saved_label}' 피드백 저장 완료")
+                st.rerun()
 
     # ══════════════════════════════════════════════════
     # MANUAL MODE (existing 5-step pipeline)
@@ -2823,18 +3620,6 @@ elif page == "📝 콜드메일":
         col1, col2 = st.columns(2)
 
         with col1:
-            # Product selection
-            products = load_products()
-            if products:
-                product_options = {f"{num}번: {name}": num for num, name in products.items()}
-                selected_product_label = st.selectbox(
-                    "제품 선택",
-                    list(product_options.keys()),
-                )
-                product_number = product_options[selected_product_label]
-            else:
-                product_number = st.number_input("제품 번호", min_value=1, max_value=10, value=1)
-
             # Language
             language = st.selectbox("언어", ["ja (일본어)", "en (영어)"], index=0)
             language_code = language.split(" ")[0]
@@ -2941,11 +3726,13 @@ elif page == "📝 콜드메일":
                 try:
                     from claude_client import ClaudeClient
                     claude = ClaudeClient()
+                    _manual_profile_id = st.session_state.get("active_profile_id")
+                    _manual_feedback = db.get_combined_email_feedback_text(_manual_profile_id)
                     result = claude.generate_coldmail(
                         csv_content=st.session_state.csv_data,
-                        product_number=product_number,
                         language=language_code,
                         extra_instructions=full_instructions,
+                        feedback_text=_manual_feedback,
                     )
 
                     st.session_state.generated_md = result

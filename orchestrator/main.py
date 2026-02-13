@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 # ── Phase 1: Content Generation ─────────────────────────
 
-def phase1_generate(csv_path: str, product_number: int = 1) -> str:
+def phase1_generate(csv_path: str) -> str:
     """
     Generate cold emails using Claude API.
 
@@ -52,7 +52,6 @@ def phase1_generate(csv_path: str, product_number: int = 1) -> str:
     # Generate emails via Claude (uses /coldmail skill)
     result = claude.generate_coldmail(
         csv_content=csv_content,
-        product_number=product_number,
     )
 
     today = datetime.now().strftime("%y%m%d")
@@ -276,7 +275,7 @@ def prospect_search(
     search_name: str | None = None,
     max_results: int = 100,
     enrich: bool = True,
-    min_fit_score: float = 5.0,
+    min_fit_score: float = 0,
     hunter_lookup: bool = True,
     industry_research: bool = True,
     verify_emails: bool = True,
@@ -510,13 +509,13 @@ def prospect_search(
     # ── Phase 6: Export ──────────────────────────────
     db.update_prospect_search(search_id, status="completed", completed_at=datetime.now().isoformat())
 
-    csv_content = db.export_prospects_to_csv(search_id, min_fit_score=min_fit_score)
+    csv_content = db.export_prospects_to_csv(search_id)
     if csv_content.strip():
         today = datetime.now().strftime("%y%m%d")
         csv_path = OUTPUT_DIR / f"prospects_{today}.csv"
         csv_path.write_text(csv_content, encoding="utf-8-sig")
-        qualified = db.get_prospects(search_id=search_id, min_fit_score=min_fit_score)
-        logger.info(f"Exported {len(qualified)} qualified prospects to {csv_path}")
+        exported = db.get_prospects(search_id=search_id)
+        logger.info(f"Exported {len(exported)} prospects to {csv_path}")
 
     logger.info(f"Prospect search complete. Search ID: {search_id}")
     return search_id
@@ -553,19 +552,12 @@ def _apply_enrichment(search_id: int, enriched_text: str):
             updates["email"] = row["email"]
         if row.get("email_confidence"):
             updates["email_confidence"] = row["email_confidence"]
-        if row.get("fit_score"):
-            try:
-                updates["fit_score"] = float(row["fit_score"])
-            except ValueError:
-                pass
-        if row.get("fit_reason"):
-            updates["fit_reason"] = row["fit_reason"]
         db.update_prospect(pid, **updates)
 
 
 # ── Full Pipeline ────────────────────────────────────────
 
-def full_pipeline(csv_path: str, product_number: int = 1, campaign_name: str | None = None,
+def full_pipeline(csv_path: str, campaign_name: str | None = None,
                    skip_send: bool = False):
     """
     Run the complete pipeline:
@@ -576,7 +568,7 @@ def full_pipeline(csv_path: str, product_number: int = 1, campaign_name: str | N
     logger.info("Starting full pipeline...")
 
     # Phase 1a: Generate (outputs MD + extracts CSV)
-    md_path = phase1_generate(csv_path, product_number)
+    md_path = phase1_generate(csv_path)
 
     # Phase 1b: Review
     phase1_review(md_path, auto_fix=True)
@@ -618,7 +610,6 @@ def main():
     # run: full pipeline
     p_run = subparsers.add_parser("run", help="Full pipeline: generate → review → send")
     p_run.add_argument("--csv", required=True, help="Input CSV path")
-    p_run.add_argument("--product", type=int, default=1, help="Product number (default: 1)")
     p_run.add_argument("--name", help="Campaign name")
     p_run.add_argument("--skip-send", action="store_true", help="Generate & review only, skip sending")
 
@@ -658,7 +649,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "run":
-        full_pipeline(args.csv, args.product, args.name, skip_send=args.skip_send)
+        full_pipeline(args.csv, args.name, skip_send=args.skip_send)
     elif args.command == "send":
         phase2_send(args.csv, args.name)
     elif args.command == "followup":

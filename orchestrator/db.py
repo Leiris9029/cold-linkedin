@@ -210,6 +210,21 @@ def init_db():
     """)
     conn.commit()
 
+    # email_feedback — per-profile (or global) feedback for Agent 3 (cold email writing)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS email_feedback (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id      INTEGER,   -- NULL = global, else campaign_profiles.id
+            feedback        TEXT NOT NULL,
+            created_at      TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_email_feedback_profile
+            ON email_feedback(profile_id)
+    """)
+    conn.commit()
+
     # -- Schema migration: add columns for v2 pipeline --
     _migration_columns = [
         ("prospects", "hunter_email", "TEXT"),
@@ -224,6 +239,9 @@ def init_db():
         ("search_presets", "product_description", "TEXT"),
         ("search_presets", "target_hint", "TEXT"),
         ("search_presets", "target_region", "TEXT"),
+        ("search_presets", "preset_type", "TEXT DEFAULT 'company'"),
+        ("search_presets", "institutions", "TEXT"),
+        ("search_presets", "research_areas", "TEXT"),
     ]
     for table, column, col_type in _migration_columns:
         try:
@@ -406,13 +424,17 @@ def save_preset(name: str, industry: str = "", titles: str = "",
                 feedback_hash: str = "",
                 product_description: str = "",
                 target_hint: str = "",
-                target_region: str = "") -> int:
+                target_region: str = "",
+                preset_type: str = "company",
+                institutions: str = "",
+                research_areas: str = "") -> int:
     conn = get_connection()
     cur = conn.execute("""
         INSERT INTO search_presets
             (name, industry, titles, locations, companies, keywords,
-             max_results, feedback_hash, product_description, target_hint, target_region)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             max_results, feedback_hash, product_description, target_hint, target_region,
+             preset_type, institutions, research_areas)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
             industry=excluded.industry, titles=excluded.titles,
             locations=excluded.locations, companies=excluded.companies,
@@ -421,9 +443,13 @@ def save_preset(name: str, industry: str = "", titles: str = "",
             product_description=excluded.product_description,
             target_hint=excluded.target_hint,
             target_region=excluded.target_region,
+            preset_type=excluded.preset_type,
+            institutions=excluded.institutions,
+            research_areas=excluded.research_areas,
             updated_at=datetime('now')
     """, (name, industry, titles, locations, companies, keywords,
-          max_results, feedback_hash, product_description, target_hint, target_region))
+          max_results, feedback_hash, product_description, target_hint, target_region,
+          preset_type, institutions, research_areas))
     conn.commit()
     preset_id = cur.lastrowid
     conn.close()
@@ -530,6 +556,91 @@ def clear_target_feedback(profile_id: int | None = None):
         conn.execute("DELETE FROM target_feedback WHERE profile_id IS NULL")
     else:
         conn.execute("DELETE FROM target_feedback WHERE profile_id = ?", (profile_id,))
+    conn.commit()
+    conn.close()
+
+
+# ── Email Feedback CRUD (Agent 3) ────────────────────────
+
+def add_email_feedback(
+    feedback: str,
+    profile_id: int | None = None,
+) -> int:
+    """Add an email writing feedback entry. profile_id=None → global feedback."""
+    conn = get_connection()
+    cur = conn.execute(
+        """INSERT INTO email_feedback (profile_id, feedback)
+           VALUES (?, ?)""",
+        (profile_id, feedback.strip()),
+    )
+    conn.commit()
+    fid = cur.lastrowid
+    conn.close()
+    return fid
+
+
+def get_email_feedback(profile_id: int | None = None) -> list[dict]:
+    """Get email feedback entries for a specific profile (or global if None)."""
+    conn = get_connection()
+    if profile_id is None:
+        rows = conn.execute(
+            "SELECT * FROM email_feedback WHERE profile_id IS NULL ORDER BY created_at"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM email_feedback WHERE profile_id = ? ORDER BY created_at",
+            (profile_id,),
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_combined_email_feedback_text(profile_id: int | None = None) -> str:
+    """Get combined email feedback: global + profile-specific, formatted as text."""
+    conn = get_connection()
+    global_rows = conn.execute(
+        "SELECT feedback, created_at FROM email_feedback "
+        "WHERE profile_id IS NULL ORDER BY created_at"
+    ).fetchall()
+    profile_rows = []
+    if profile_id is not None:
+        profile_rows = conn.execute(
+            "SELECT feedback, created_at FROM email_feedback "
+            "WHERE profile_id = ? ORDER BY created_at",
+            (profile_id,),
+        ).fetchall()
+    conn.close()
+
+    lines = []
+    if global_rows:
+        lines.append("## 글로벌 피드백 (모든 프로필 공통)")
+        for r in global_rows:
+            ts = r["created_at"][:16] if r["created_at"] else ""
+            lines.append(f"- [{ts}] {r['feedback']}")
+    if profile_rows:
+        lines.append("")
+        lines.append("## 캠페인 프로필 전용 피드백")
+        for r in profile_rows:
+            ts = r["created_at"][:16] if r["created_at"] else ""
+            lines.append(f"- [{ts}] {r['feedback']}")
+
+    return "\n".join(lines)
+
+
+def delete_email_feedback(feedback_id: int):
+    conn = get_connection()
+    conn.execute("DELETE FROM email_feedback WHERE id = ?", (feedback_id,))
+    conn.commit()
+    conn.close()
+
+
+def clear_email_feedback(profile_id: int | None = None):
+    """Clear all email feedback for a profile (or global if None)."""
+    conn = get_connection()
+    if profile_id is None:
+        conn.execute("DELETE FROM email_feedback WHERE profile_id IS NULL")
+    else:
+        conn.execute("DELETE FROM email_feedback WHERE profile_id = ?", (profile_id,))
     conn.commit()
     conn.close()
 
@@ -741,9 +852,9 @@ def delete_prospect_search(search_id: int):
 
 def add_prospect(search_id: int, contact_name: str, email: str, company: str,
                  title: str, linkedin_url: str = "", location: str = "",
-                 fit_score: float = 0, fit_reason: str = "",
                  email_confidence: str = "unknown", source: str = "apollo",
-                 source_data: str = "") -> int | None:
+                 source_data: str = "",
+                 fit_score: float = 0, fit_reason: str = "") -> int | None:
     """Add a prospect, skipping if duplicate email+company exists."""
     conn = get_connection()
     try:
@@ -774,10 +885,7 @@ def get_prospects(search_id: int | None = None, status: str | None = None,
     if status:
         query += " AND status = ?"
         params.append(status)
-    if min_fit_score is not None:
-        query += " AND fit_score >= ?"
-        params.append(min_fit_score)
-    query += " ORDER BY fit_score DESC"
+    query += " ORDER BY id DESC"
     rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -839,12 +947,12 @@ def add_email_verification(prospect_id: int, email: str, status: str,
     return vid
 
 
-def export_prospects_to_csv(search_id: int, min_fit_score: float = 5.0) -> str:
-    """Export qualified prospects as CSV string ready for /coldmail pipeline."""
+def export_prospects_to_csv(search_id: int, min_fit_score: float = 0) -> str:
+    """Export prospects as CSV string ready for /coldmail pipeline."""
     import io
     import csv as csv_mod
 
-    prospects = get_prospects(search_id=search_id, min_fit_score=min_fit_score)
+    prospects = get_prospects(search_id=search_id)
     prospects = [p for p in prospects if p.get("email")
                  and p.get("verification_status") != "undeliverable"]
 

@@ -455,6 +455,186 @@ class CompanyListingAgent(BaseAgent):
 
 
 # ═══════════════════════════════════════════════════════════════
+# Agent 1B: Researcher Finder
+# ═══════════════════════════════════════════════════════════════
+
+class ResearcherFinderAgent(BaseAgent):
+    """Finds target researchers via 3-phase pipeline (query→search→analyze).
+
+    Same structure as CompanyListingAgent but targets academic researchers:
+    - Phase 1: Claude generates academic search queries (1 API call)
+    - Phase 2: Python executes all searches (0 API calls)
+    - Phase 3: Claude analyzes results and produces JSON (1 API call)
+    """
+
+    def __init__(self, extra_feedback: str = "", **kwargs):
+        kwargs.setdefault("model", CLAUDE_MODEL)
+        super().__init__(**kwargs)
+        from research_client import ResearchClient
+        self._rc = ResearchClient()
+        self._final_result: str | None = None
+        self._extra_feedback = extra_feedback
+
+    @property
+    def result_json(self) -> str | None:
+        return self._final_result
+
+    # -- not needed for pipeline mode, kept for compatibility --
+    def _get_tools(self) -> list[dict]:
+        return []
+
+    def _get_system_prompt(self, user_request: str) -> str:
+        return ""
+
+    def _execute_tool(self, name: str, input_data: dict) -> str:
+        return ""
+
+    def run(self, user_request: str) -> str:
+        """3-phase pipeline: query generation → batch search → analysis."""
+        skill = self._load_skill("researcher_finder")
+        feedback = self._extra_feedback.strip()
+        feedback_section = f"\n\n## 과거 피드백 (반드시 우선 반영)\n{feedback}" if feedback else ""
+
+        logger.info(
+            "[ResearcherFinder] feedback=%d chars, feedback_section=%d chars",
+            len(feedback), len(feedback_section),
+        )
+        if self.on_text and self._extra_feedback:
+            self.on_text(f"📋 프로필 피드백 적용됨 ({len(self._extra_feedback)}자)")
+
+        # ── Phase 1: Generate search queries (academic-focused) ──
+        if self.on_text:
+            self.on_text("🔍 Phase 1: 검색 쿼리 생성 중...")
+
+        query_prompt = (
+            "You are an academic research discovery assistant. "
+            "Given the product description below, generate 12-15 diverse web search queries "
+            "that would find relevant academic researchers, professors, and principal investigators.\n\n"
+            "Requirements:\n"
+            "- All queries in English for best coverage\n"
+            "- Mix of: PubMed/Google Scholar search terms, university department pages, "
+            "conference speaker lists, research center directories, lab pages\n"
+            "- Include queries for specific research topics (e.g., 'EEG biomarker researchers psychiatry')\n"
+            "- Include queries for university neuroscience/psychiatry departments if relevant\n"
+            "- Include queries for clinical trial PIs on ClinicalTrials.gov\n"
+            "- Include region-specific queries if a target region is mentioned\n"
+            "- Target: professors, principal investigators, lab directors, department chairs\n"
+            "- Do NOT generate generic queries — be specific to the research domain\n\n"
+            f"## Product/Request\n{user_request}\n"
+            f"{feedback_section}\n\n"
+            "Output ONLY a JSON array of query strings, nothing else. Example:\n"
+            '[\"EEG biomarker researchers psychiatry clinical trials\", '
+            '\"computational neuroscience lab directors sleep research\", ...]'
+        )
+
+        response = self._api_call_with_retry(
+            model=self.model,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": query_prompt}],
+        )
+        query_text = response.content[0].text.strip()
+
+        # Parse queries from JSON
+        try:
+            if "```" in query_text:
+                query_text = query_text.split("```")[1]
+                if query_text.startswith("json"):
+                    query_text = query_text[4:]
+            queries = json.loads(query_text)
+            if not isinstance(queries, list):
+                queries = [query_text]
+        except json.JSONDecodeError:
+            queries = [q.strip().strip('"').strip("'") for q in query_text.split("\n") if q.strip()]
+
+        queries = queries[:15]
+
+        if self.on_text:
+            self.on_text(f"📋 {len(queries)}개 검색 쿼리 생성 완료")
+        if self.on_tool_call:
+            self.on_tool_call("search_queries", {"queries": queries})
+
+        # ── Phase 2: Execute all searches in Python ───────
+        if self.on_text:
+            self.on_text("🌐 Phase 2: 웹 검색 실행 중...")
+
+        def _search_progress(current, total, query):
+            if self.on_tool_call:
+                self.on_tool_call("search_web", {"query": query, "progress": f"{current+1}/{total}"})
+
+        search_results = self._rc.search_for_targets(
+            queries=queries,
+            max_per_query=10,
+            progress_callback=_search_progress,
+        )
+
+        if self.on_text:
+            result_len = len(search_results)
+            self.on_text(f"📊 검색 완료: {result_len:,}자 데이터 수집")
+        if self.on_tool_result:
+            self.on_tool_result("search_for_targets", f"Collected {len(search_results):,} chars of search data")
+
+        # ── Phase 3: Analyze and produce JSON ─────────────
+        if self.on_text:
+            self.on_text("🧠 Phase 3: 결과 분석 및 연구자 분류 중...")
+
+        max_context = 80000
+        if len(search_results) > max_context:
+            search_results = search_results[:max_context] + "\n\n... (결과 일부 생략)"
+
+        analysis_prompt = (
+            f"{skill}\n\n---\n\n"
+            f"## 사용자 요청\n{user_request}\n\n"
+            f"## 웹 검색 결과 (아래 데이터에서만 연구자를 추출할 것)\n\n"
+            f"{search_results}\n\n"
+            f"---\n"
+            f"{feedback_section}\n\n---\n\n"
+            f"위 검색 결과를 분석하여 타겟 연구자 목록을 JSON으로 출력하세요.\n"
+            f"- 검색 결과에서 발견된 연구자만 추천 (내장 지식으로 추가 금지)\n"
+            f"- evidence는 검색에서 확인된 구체적 사실만 기재\n"
+            f"- Tier 1: 최소 20명, Tier 2: 최소 15명 → 합계 35명 이상 목표\n"
+            f"- JSON만 출력 (설명 텍스트 불필요)\n"
+            f"- ⚠️ 과거 피드백이 있으면 반드시 우선 반영할 것\n"
+        )
+
+        response = self._api_call_with_retry(
+            model=self.model,
+            max_tokens=16384,
+            messages=[{"role": "user", "content": analysis_prompt}],
+        )
+
+        result_text = response.content[0].text.strip()
+
+        # Extract JSON from response
+        json_text = result_text
+        if "```" in json_text:
+            parts = json_text.split("```")
+            for part in parts[1:]:
+                candidate = part.strip()
+                if candidate.startswith("json"):
+                    candidate = candidate[4:].strip()
+                if candidate.startswith("{"):
+                    json_text = candidate
+                    break
+
+        # Validate and save
+        try:
+            parsed = json.loads(json_text)
+            self._final_result = json.dumps(parsed, ensure_ascii=False)
+            t1 = len(parsed.get("tier1_researchers", []))
+            t2 = len(parsed.get("tier2_researchers", []))
+            if self.on_text:
+                self.on_text(f"✅ 완료: Tier 1: {t1}명, Tier 2: {t2}명, 합계: {t1+t2}명")
+            if self.on_tool_result:
+                self.on_tool_result("save_results", f"Tier 1: {t1}, Tier 2: {t2}, Total: {t1+t2}")
+            return result_text
+        except json.JSONDecodeError:
+            self._final_result = None
+            if self.on_text:
+                self.on_text("⚠️ JSON 파싱 실패 — 원본 텍스트를 반환합니다")
+            return result_text
+
+
+# ═══════════════════════════════════════════════════════════════
 # Agent 2: Email Finder
 # ═══════════════════════════════════════════════════════════════
 
@@ -975,8 +1155,6 @@ class EmailFinderAgent(BaseAgent):
                                     "source": {"type": "string", "description": "hunter/findymail/web"},
                                     "linkedin_url": {"type": "string"},
                                     "location": {"type": "string"},
-                                    "fit_score": {"type": "integer", "description": "1-10"},
-                                    "fit_reason": {"type": "string"},
                                 },
                                 "required": ["contact_name", "company"],
                             },
@@ -1050,7 +1228,7 @@ class EmailFinderAgent(BaseAgent):
             f"- **Findymail은 이름+도메인만 있으면 이메일을 찾을 수 있습니다** (무료가 아니지만 정확도 높음)\n"
             f"- 한 턴에 5~8명씩 배치 호출\n\n"
             f"**Step 4: Findymail 검증** (필요시 1~2턴)\n"
-            f"- Hunter에서 confidence가 낮은(<70) 이메일만 findymail_search로 검증\n\n"
+            f"- Hunter에서 confidence가 낮은(<90) 이메일은 자동으로 Findymail 검증됨\n\n"
             f"**저장 방법**\n"
             f"- **Hunter 결과 → 자동 저장** (add_contacts 호출 불필요)\n"
             f"- **Findymail/웹 결과 → add_contacts로 수동 저장** (이름, 회사, 직함 필수)\n"
@@ -1149,7 +1327,7 @@ class EmailFinderAgent(BaseAgent):
 
                 # Auto-save ALL matched contacts to DB (with Findymail verification for low conf)
                 company_name = input_data.get("company_name", input_data["domain"])
-                high_count = sum(1 for c in matched if c.get("confidence", 0) >= 70)
+                high_count = sum(1 for c in matched if c.get("confidence", 0) >= 90)
                 low_count = len(matched) - high_count
                 auto_saved = self._auto_save_hunter_contacts(matched, company_name)
 
@@ -1255,8 +1433,8 @@ class EmailFinderAgent(BaseAgent):
     def _auto_save_hunter_contacts(self, matched: list[dict], company_name: str) -> int:
         """Auto-save Hunter matched contacts to DB.
 
-        Contacts with confidence >= 70 are saved directly.
-        Contacts with confidence < 70 are verified via Findymail first.
+        Contacts with confidence >= 90 are saved directly.
+        Contacts with confidence < 90 are verified via Findymail first.
         Returns count saved.
         """
         if not matched:
@@ -1276,36 +1454,34 @@ class EmailFinderAgent(BaseAgent):
             name = (c.get("name") or "").strip()
             if not name:
                 continue
-            if c.get("confidence", 0) >= 70:
+            if c.get("confidence", 0) >= 90:
                 high_conf.append(c)
             else:
                 needs_verify.append(c)
 
-        # Verify low-confidence contacts via Findymail (parallel)
-        verified_map = {}  # name -> verified_email
-        if needs_verify and domain:
+        # Verify low-confidence emails via Findymail Verifier Credit (parallel)
+        # Only verify contacts that actually HAVE an email from Hunter
+        verify_results = {}  # name -> "valid"|"invalid"|"unknown"
+        to_verify = [c for c in needs_verify if c.get("email")]
+        if to_verify:
             try:
                 fm = self._get_findymail()
                 from concurrent.futures import ThreadPoolExecutor, as_completed
 
                 def _verify(contact):
                     try:
-                        result = fm.find_email(
-                            name=contact["name"],
-                            domain=domain,
-                        )
-                        c_data = result.get("contact") or {}
-                        return contact["name"], c_data.get("email") or result.get("email") or ""
+                        result = fm.verify_email(contact["email"])
+                        status = result.get("status", "unknown")
+                        return contact["name"], status
                     except Exception:
-                        return contact["name"], ""
+                        return contact["name"], "unknown"
 
-                with ThreadPoolExecutor(max_workers=min(len(needs_verify), 5)) as pool:
-                    futures = [pool.submit(_verify, c) for c in needs_verify]
+                with ThreadPoolExecutor(max_workers=min(len(to_verify), 5)) as pool:
+                    futures = [pool.submit(_verify, c) for c in to_verify]
                     for f in as_completed(futures):
-                        name, email = f.result()
-                        if email:
-                            verified_map[name] = email
-                            self._credits_used["findymail"] += 1
+                        name, status = f.result()
+                        verify_results[name] = status
+                        self._credits_used["findymail"] += 1
             except Exception as e:
                 logger.warning(f"Findymail batch verify failed: {e}")
 
@@ -1323,12 +1499,11 @@ class EmailFinderAgent(BaseAgent):
             })
         for c in needs_verify:
             name = c["name"]
-            fm_email = verified_map.get(name)
-            if fm_email:
-                # Findymail verified — use verified email
+            fm_status = verify_results.get(name)
+            if fm_status == "valid":
                 contacts_for_save.append({
                     "contact_name": name,
-                    "email": fm_email,
+                    "email": c.get("email", ""),
                     "company": company_name,
                     "title": c.get("position", ""),
                     "linkedin_url": c.get("linkedin", ""),
@@ -1336,16 +1511,8 @@ class EmailFinderAgent(BaseAgent):
                     "source": "hunter+findymail",
                 })
             else:
-                # Findymail couldn't verify — save with unverified tag
-                contacts_for_save.append({
-                    "contact_name": name,
-                    "email": c.get("email", ""),
-                    "company": company_name,
-                    "title": c.get("position", ""),
-                    "linkedin_url": c.get("linkedin", ""),
-                    "email_confidence": "unverified",
-                    "source": "hunter",
-                })
+                # invalid / unknown / no email → skip (don't save unverified contacts)
+                logger.info(f"Skipping {name} — email confidence too low (fm_status={fm_status})")
 
         if not contacts_for_save:
             return 0
@@ -1375,9 +1542,19 @@ class EmailFinderAgent(BaseAgent):
 
         # Filter out junk entries: "Unknown", metadata, placeholder names
         _JUNK_NAMES = {"unknown", "clinical team", "n/a", "none", "tbd", ""}
+
+        # Build set of already-accumulated contacts to skip Hunter auto-saved duplicates
+        _existing = set()
+        for ac in self._accumulated_contacts:
+            _e = (ac.get("email") or "").strip().lower()
+            _co = (ac.get("company") or "").strip().lower()
+            _n = (ac.get("contact_name") or "").strip().lower()
+            _existing.add((_e, _co) if _e else (_n, _co))
+
         saved = 0
         dupes = 0
         skipped = 0
+        already_auto_saved = 0
         for c in contacts:
             name = (c.get("contact_name") or "").strip()
             # Reject empty, unknown, or metadata-like names
@@ -1387,6 +1564,21 @@ class EmailFinderAgent(BaseAgent):
             if name.startswith("[") or "verification" in name.lower() or "processing" in name.lower():
                 skipped += 1
                 continue
+
+            # Skip if already in _accumulated_contacts (e.g. Hunter auto-saved)
+            _e = (c.get("email") or "").strip().lower()
+            _co = (c.get("company") or "").strip().lower()
+            _key = (_e, _co) if _e else (name.lower(), _co)
+            if _key in _existing:
+                already_auto_saved += 1
+                continue
+
+            # Skip unverified / low confidence contacts
+            conf = (c.get("email_confidence") or "").strip().lower()
+            if conf in ("unverified", "low", "invalid", "unknown"):
+                skipped += 1
+                continue
+
             try:
                 pid = db.add_prospect(
                     search_id=self._search_id,
@@ -1396,14 +1588,12 @@ class EmailFinderAgent(BaseAgent):
                     title=c.get("title", c.get("position", "")),
                     linkedin_url=c.get("linkedin_url", c.get("linkedin", "")),
                     location=c.get("location", ""),
-                    fit_score=c.get("fit_score", 0),
-                    fit_reason=c.get("fit_reason", ""),
                     email_confidence=c.get("email_confidence", "unknown"),
                     source=c.get("source", "agent"),
                     source_data=json.dumps(c, ensure_ascii=False),
                 )
-                # Always track in accumulated (for coverage counting), even if DB duplicate
                 self._accumulated_contacts.append(c)
+                _existing.add(_key)
                 if pid:
                     saved += 1
                 else:
@@ -1436,6 +1626,8 @@ class EmailFinderAgent(BaseAgent):
 
         with_email = sum(1 for c in self._accumulated_contacts if c.get("email"))
         extra = []
+        if already_auto_saved:
+            extra.append(f"{already_auto_saved} already auto-saved by Hunter")
         if dupes:
             extra.append(f"{dupes} already in DB")
         if skipped:
@@ -1454,45 +1646,368 @@ class EmailFinderAgent(BaseAgent):
 # ═══════════════════════════════════════════════════════════════
 
 class ColdMailAgent(BaseAgent):
-    """Writes personalized cold emails with per-company web research.
+    """Writes personalized cold emails with 2-phase approach.
 
-    Tools: read_file, search_web, fetch_webpage, load_prospects,
-           save_draft_email, finalize_campaign, upload_to_sheets,
-           send_gmass_campaign
+    Phase 1: Research each company once (web search + page fetch)
+    Phase 2: Generate individual emails per person via lightweight API calls
 
-    Flow: read data → load prospects → research each company →
-          write & save email → finalize campaign → (optional) send
+    This avoids the expensive per-person agentic loop that accumulated
+    context tokens. Instead:
+    - Company research is done programmatically (not via agent loop)
+    - Email generation is done via direct Claude API calls (1 per person)
     """
 
-    MAX_TURNS = 80  # ~5 tool calls per company × 10 companies + overhead
+    MAX_TURNS = 80  # kept for legacy fallback
 
     def __init__(
         self,
-        product_number: int = 1,
         language: str = "ja",
         cta_type: str = "",
         extra_instructions: str = "",
         campaign_context: str = "",
         sender_profile_md: str = "",
+        profile_id: int | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self._rc = None
-        self._product_number = product_number
         self._language = language
         self._cta_type = cta_type
         self._extra_instructions = extra_instructions
         self._campaign_context = campaign_context
         self._sender_profile_md = sender_profile_md
+        self._profile_id = profile_id
         self._draft_emails: list[dict] = []
         self._campaign_id: int | None = None
         self._csv_content: str | None = None
+        self._company_research: dict[str, str] = {}  # company → research text
 
     def _get_research(self):
         if self._rc is None:
             from research_client import ResearchClient
             self._rc = ResearchClient()
         return self._rc
+
+    # ── 2-Phase run() override ────────────────────────────
+
+    def run(self, user_request: str) -> str:
+        """2-phase run: company research → per-person email generation."""
+        import csv as csv_mod
+        import io
+
+        if self.on_text:
+            self.on_text("📋 데이터 로드 중...")
+
+        # ── Parse prospects from user_request ──
+        prospects = self._parse_prospects(user_request)
+        if not prospects:
+            return "Error: No prospects found. Provide CSV data or search_id."
+
+        # Filter to only those with email
+        prospects_with_email = [p for p in prospects if p.get("email")]
+        if not prospects_with_email:
+            return "Error: No prospects with email addresses found."
+
+        if self.on_text:
+            self.on_text(f"✅ {len(prospects_with_email)}명 로드 (이메일 있는 연락처)")
+
+        # ── Group by company ──
+        company_groups: dict[str, list[dict]] = {}
+        for p in prospects_with_email:
+            company = (p.get("company") or "Unknown").strip()
+            company_groups.setdefault(company, []).append(p)
+
+        num_companies = len(company_groups)
+        if self.on_text:
+            self.on_text(f"🏢 {num_companies}개 회사로 그룹핑 완료")
+
+        # ── Load context ──
+        sender_profile = self._sender_profile_md or self._load_data_file("sender_profile.md")
+        import db as _db
+        feedback_log = _db.get_combined_email_feedback_text(self._profile_id)
+        writing_system = self._build_email_system_prompt(
+            sender_profile, feedback_log,
+        )
+
+        # ── Phase 1: Company research ──
+        if self.on_text:
+            self.on_text(f"\n🔍 Phase 1: 회사별 리서치 시작 ({num_companies}개)")
+
+        for i, (company, members) in enumerate(company_groups.items(), 1):
+            if self.on_text:
+                self.on_text(f"  [{i}/{num_companies}] {company} 리서치 중...")
+            if self.on_tool_call:
+                self.on_tool_call("search_web", {"company": company})
+
+            research = self._research_company(company)
+            self._company_research[company] = research
+
+            if self.on_tool_result:
+                preview = research[:200] + "..." if len(research) > 200 else research
+                self.on_tool_result("search_web", f"✅ {company}: {preview}")
+
+        if self.on_text:
+            self.on_text(f"\n✅ Phase 1 완료: {num_companies}개 회사 리서치 완료")
+
+        # ── Phase 2: Per-person email generation ──
+        total_people = len(prospects_with_email)
+        if self.on_text:
+            self.on_text(f"\n✉️ Phase 2: 사람별 이메일 생성 시작 ({total_people}명)")
+
+        generated = 0
+        failed = 0
+        for company, members in company_groups.items():
+            research = self._company_research.get(company, "")
+            for person in members:
+                generated += 1
+                name = person.get("contact_name", "Unknown")
+                if self.on_text and generated % 10 == 1:
+                    self.on_text(f"  [{generated}/{total_people}] {name} ({company})...")
+
+                try:
+                    email_data = self._generate_email(
+                        person, research, writing_system,
+                    )
+                    if email_data:
+                        self._save_draft(email_data)
+                    else:
+                        failed += 1
+                except Exception as e:
+                    logger.warning(f"Email generation failed for {name}: {e}")
+                    failed += 1
+
+        if self.on_text:
+            self.on_text(
+                f"\n✅ Phase 2 완료: {len(self._draft_emails)}개 이메일 생성"
+                + (f" ({failed}개 실패)" if failed else "")
+            )
+
+        # ── Phase 3: Finalize ──
+        if self._draft_emails:
+            result = self._finalize()
+            if self.on_text:
+                self.on_text(f"📦 {result}")
+
+        return json.dumps({
+            "drafts": len(self._draft_emails),
+            "companies": num_companies,
+            "failed": failed,
+        }, ensure_ascii=False)
+
+    def _parse_prospects(self, user_request: str) -> list[dict]:
+        """Extract prospect list from the user request.
+
+        Looks for CSV text embedded in the request, or search_id reference.
+        """
+        import csv as csv_mod
+        import io
+        import re
+
+        # Check for CSV text (look for csv header pattern)
+        if "contact_name" in user_request and "," in user_request:
+            # Find CSV block — everything after the first line with contact_name
+            lines = user_request.split("\n")
+            csv_start = None
+            for idx, line in enumerate(lines):
+                if "contact_name" in line and ("email" in line or "company" in line):
+                    csv_start = idx
+                    break
+            if csv_start is not None:
+                csv_text = "\n".join(lines[csv_start:])
+                reader = csv_mod.DictReader(io.StringIO(csv_text))
+                return list(reader)
+
+        # Check for search_id
+        m = re.search(r"search_id[=:\s]+(\d+)", user_request)
+        if m:
+            import db
+            prospects = db.get_prospects(search_id=int(m.group(1)))
+            return [
+                {
+                    "contact_name": p["contact_name"],
+                    "email": p.get("email", ""),
+                    "company": p.get("company", ""),
+                    "title": p.get("title", ""),
+                    "linkedin_url": p.get("linkedin_url", ""),
+                    "location": p.get("location", ""),
+                }
+                for p in prospects
+            ]
+
+        # Fallback: try parsing entire request as CSV
+        try:
+            reader = csv_mod.DictReader(io.StringIO(user_request))
+            rows = list(reader)
+            if rows and "contact_name" in rows[0]:
+                return rows
+        except Exception:
+            pass
+
+        return []
+
+    def _research_company(self, company: str) -> str:
+        """Phase 1: Web research for a single company."""
+        rc = self._get_research()
+        research_parts = []
+
+        # Search 1: Company + recent news/research
+        try:
+            results = rc._web_search(
+                f'"{company}" research OR publication OR announcement OR news 2025 2026',
+                max_results=5,
+            )
+            for r in results[:3]:
+                title = r.get("title", "")
+                snippet = r.get("body", "")[:300]
+                research_parts.append(f"- {title}: {snippet}")
+
+                # Fetch top result page for more detail
+                url = r.get("href", "")
+                if url and len(research_parts) <= 2:
+                    page = rc._fetch_page_text(url, max_chars=2000)
+                    if page:
+                        research_parts.append(f"  [Page content]: {page[:1500]}")
+        except Exception as e:
+            logger.warning(f"Research search failed for {company}: {e}")
+
+        # Search 2: Careers/hiring signals
+        try:
+            career_results = rc._web_search(
+                f'"{company}" careers OR jobs OR hiring 2025 2026',
+                max_results=3,
+            )
+            for r in career_results[:2]:
+                title = r.get("title", "")
+                snippet = r.get("body", "")[:200]
+                research_parts.append(f"- [Hiring] {title}: {snippet}")
+        except Exception as e:
+            logger.warning(f"Career search failed for {company}: {e}")
+
+        if not research_parts:
+            return f"(No recent research found for {company})"
+
+        return f"## {company} Research\n" + "\n".join(research_parts)
+
+    def _build_email_system_prompt(
+        self, sender_profile: str, feedback_log: str,
+    ) -> str:
+        """Build the system prompt for Phase 2 email generation calls."""
+        # Load writing rules
+        try:
+            if self._language == "en":
+                writing_rules = self._load_skill("coldmail_en")
+            else:
+                writing_rules = self._load_skill("coldmail")
+        except FileNotFoundError:
+            writing_rules = ""
+
+        cta_line = f"- CTA: {self._cta_type}" if self._cta_type else "- CTA: 직함 기반 자동 선택"
+        extra_line = f"- 추가 지시사항: {self._extra_instructions}" if self._extra_instructions else ""
+
+        # campaign_context includes product info from profile
+        campaign_section = ""
+        if self._campaign_context:
+            campaign_section = f"\n{self._campaign_context}\n"
+
+        return (
+            f"당신은 B2B 콜드메일 작성 전문가입니다.\n"
+            f"주어진 회사 리서치 결과와 수신자 정보를 바탕으로 **개인화된** 콜드메일 1통을 작성합니다.\n"
+            f"같은 회사/직함이라도 표현과 구조를 매번 다르게 써서 템플릿 느낌을 없애세요.\n\n"
+            f"---\n\n"
+            f"## 작성 규칙\n{writing_rules}\n\n"
+            f"---\n\n"
+            f"## 발신자 프로필\n{sender_profile}\n\n"
+            f"## 피드백 로그 (반드시 반영)\n{feedback_log}\n\n"
+            f"## 캠페인 설정\n"
+            f"- 언어: {self._language}\n"
+            f"{cta_line}\n"
+            f"{extra_line}\n"
+            f"{campaign_section}\n\n"
+            f"---\n\n"
+            f"## 출력 형식\n"
+            f"반드시 아래 JSON만 출력하세요. 다른 텍스트 없이 JSON만:\n"
+            f'{{"subject": "제목", "body": "본문(<br>로 줄바꿈)", '
+            f'"framework": "사용한 어프로치", "rationale": "선택 이유 1줄"}}\n'
+        )
+
+    def _generate_email(
+        self, person: dict, research: str, system_prompt: str,
+    ) -> dict | None:
+        """Phase 2: Generate one email via direct Claude API call."""
+        name = person.get("contact_name", "")
+        title = person.get("title", "")
+        company = person.get("company", "")
+        email = person.get("email", "")
+
+        user_message = (
+            f"## 수신자 정보\n"
+            f"- 이름: {name}\n"
+            f"- 직함: {title}\n"
+            f"- 회사: {company}\n"
+            f"- 이메일: {email}\n\n"
+            f"## 회사 리서치 결과\n{research}\n\n"
+            f"위 정보를 바탕으로 이 사람에게 보낼 콜드메일 1통을 JSON으로 작성하세요."
+        )
+
+        try:
+            response = self._api_call_with_retry(
+                model=self.model,
+                max_tokens=2048,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_message}],
+            )
+
+            text = response.content[0].text.strip()
+
+            # Parse JSON from response
+            parsed = self._extract_json(text)
+            if parsed and parsed.get("subject") and parsed.get("body"):
+                return {
+                    "contact_name": name,
+                    "email": email,
+                    "company": company,
+                    "title": title,
+                    "subject": parsed["subject"],
+                    "body": parsed["body"],
+                    "language": self._language,
+                    "product": 0,
+                    "framework": parsed.get("framework", ""),
+                    "rationale": parsed.get("rationale", ""),
+                }
+            else:
+                logger.warning(f"Failed to parse email JSON for {name}: {text[:200]}")
+                return None
+
+        except Exception as e:
+            logger.warning(f"API call failed for {name}: {e}")
+            return None
+
+    @staticmethod
+    def _extract_json(text: str) -> dict | None:
+        """Extract JSON object from text that may contain markdown fences."""
+        import re
+        # Try direct parse
+        text = text.strip()
+        if text.startswith("{"):
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                pass
+        # Try extracting from code fence
+        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except json.JSONDecodeError:
+                pass
+        # Try finding first { ... }
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except json.JSONDecodeError:
+                pass
+        return None
 
     @property
     def draft_emails(self) -> list[dict]:
@@ -1513,8 +2028,7 @@ class ColdMailAgent(BaseAgent):
                 "name": "read_file",
                 "description": (
                     "Read a data file from the data/ directory. "
-                    "Use to load: sender_profile.md, "
-                    "feedback_log.md"
+                    "Use to load: sender_profile.md"
                 ),
                 "input_schema": {
                     "type": "object",
@@ -1696,7 +2210,8 @@ class ColdMailAgent(BaseAgent):
             sender = self._sender_profile_md
         else:
             sender = self._load_data_file("sender_profile.md")
-        feedback = self._load_data_file("feedback_log.md")
+        import db as _db
+        feedback = _db.get_combined_email_feedback_text(self._profile_id)
 
         config_section = (
             f"\n\n---\n\n"
@@ -1786,7 +2301,6 @@ class ColdMailAgent(BaseAgent):
                     "title": p.get("title", ""),
                     "linkedin_url": p.get("linkedin_url", ""),
                     "location": p.get("location", ""),
-                    "fit_score": p.get("fit_score", 0),
                 })
             return json.dumps(result, ensure_ascii=False)
 
@@ -1809,7 +2323,7 @@ class ColdMailAgent(BaseAgent):
             "subject": data.get("subject", ""),
             "body": data.get("body", ""),
             "language": data.get("language", self._language),
-            "product": self._product_number,
+            "product": 0,
             "framework": data.get("framework", ""),
             "rationale": data.get("rationale", ""),
         }
@@ -1856,7 +2370,7 @@ class ColdMailAgent(BaseAgent):
         self._campaign_id = db.create_campaign(
             name=campaign_name,
             csv_path=str(csv_path),
-            product_number=self._product_number,
+            product_number=0,
         )
 
         # Add recipients to DB

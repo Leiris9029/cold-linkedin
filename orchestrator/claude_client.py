@@ -93,10 +93,10 @@ class ClaudeClient:
     def generate_coldmail(
         self,
         csv_content: str,
-        product_number: int = 1,
         language: str = "ja",
         extra_instructions: str = "",
         sender_profile_md: str = "",
+        feedback_text: str = "",
     ) -> str:
         """Run /coldmail skill to generate personalized cold emails."""
         skill = self._load_skill("coldmail")
@@ -104,7 +104,7 @@ class ClaudeClient:
             sender_profile = sender_profile_md
         else:
             sender_profile = self._load_data_file("sender_profile.md")
-        feedback_log = self._load_data_file("feedback_log.md")
+        feedback_log = feedback_text
 
         system_prompt = (
             f"{skill}\n\n---\n\n"
@@ -113,15 +113,15 @@ class ClaudeClient:
         )
 
         prompt = (
-            f"{product_number}번 제품으로 콜드메일 작성해줘.\n"
+            f"콜드메일 작성해줘.\n"
             f"언어: {language}\n"
             f"{extra_instructions}\n\n"
             f"## CSV 데이터\n```\n{csv_content}\n```\n\n"
             f"## 추가 출력 요청\n"
             f"메일 작성 결과를 보여준 후, 마지막에 반드시 아래 형식의 CSV 블록도 포함해줘.\n"
             f"```csv\n"
-            f"contact_name,email,company,title,product,language,subject,body\n"
-            f"(각 행: 이름,이메일,회사,직책,제품번호,언어,제목,본문)\n"
+            f"contact_name,email,company,title,language,subject,body\n"
+            f"(각 행: 이름,이메일,회사,직책,언어,제목,본문)\n"
             f"```\n"
             f"body 컬럼의 줄바꿈은 <br>로 변환해서 넣어줘. CSV 규격에 맞게 쉼표 포함 필드는 큰따옴표로 감싸줘."
         )
@@ -233,9 +233,9 @@ class ClaudeClient:
             f"결과를 CSV 형식으로 출력해줘:\n"
             f"```csv\n"
             f"contact_name,email,email_confidence,company,title,linkedin_url,"
-            f"fit_score,fit_reason,location,source\n"
+            f"location,source\n"
             f"```\n"
-            f"fit_score 내림차순 정렬. email이 없고 추론도 어려운 경우 빈칸으로."
+            f"email이 없고 추론도 어려운 경우 빈칸으로."
         )
         return self._call(system_prompt, prompt, max_tokens=16384)
 
@@ -423,6 +423,68 @@ class ClaudeClient:
 
         prompt = (
             f"아래 {len(payload)}개 회사에 대해 AI 근거와 외부 검증 데이터를 비교 분석해줘.\n\n"
+            f"```json\n{json.dumps(payload, ensure_ascii=False)}\n```"
+        )
+        return self._call(system, prompt, max_tokens=32768)
+
+    def cross_check_researcher_evidence(self, researchers_with_verification: list[dict], feedback: str = "") -> str:
+        """Cross-check AI-claimed researcher evidence against external verification data.
+
+        Takes the combined list of {name, institution, evidence, verification: {...}}
+        and asks Claude to compare AI claims with factual data, producing a
+        per-researcher verdict.
+
+        Returns: JSON string with per-researcher verdicts.
+        """
+        import json
+
+        system = (
+            "당신은 학술 연구자 팩트체커입니다. AI가 추천한 연구자 목록에 대해, "
+            "AI가 주장한 근거(evidence)와 외부에서 수집한 실제 데이터를 비교 분석합니다.\n\n"
+            "## 입력 데이터 구조\n"
+            "각 연구자에는 다음이 포함됩니다:\n"
+            "- `evidence`: AI가 주장한 해당 연구자의 연구/논문/소속 근거\n"
+            "- `verification.web_results`: 웹 검색 결과 [{title, snippet, url}]\n"
+            "- `verification.pub_topics`: PubMed 논문 제목 목록 (저자 검색)\n"
+            "- `verification.trial_titles`: ClinicalTrials.gov PI 참여 임상시험 목록\n\n"
+            "## 출력 형식\n"
+            "JSON 배열을 출력하세요. 각 요소:\n"
+            "```json\n"
+            '{"researcher": "연구자명", "verdict": "confirmed|partial|unverified|wrong", '
+            '"explanation": "한국어로 2~3문장. AI 근거의 어떤 부분이 확인되었고, 어떤 부분이 확인되지 않았는지 구체적으로 설명"}\n'
+            "```\n\n"
+            "## verdict 기준\n"
+            "- **confirmed**: 연구자의 소속/직책/연구 분야가 외부 데이터로 확인됨. PubMed 논문이 있거나 웹에서 프로필 확인.\n"
+            "- **partial**: 연구자 존재는 확인되나, AI가 주장한 구체적 연구/논문/프로젝트는 확인 불가\n"
+            "- **unverified**: 외부 데이터가 부족하여 검증 불가\n"
+            "- **wrong**: 외부 데이터가 AI 근거와 모순됨 (소속/연구 분야가 다름)\n\n"
+            "## 규칙\n"
+            "- explanation에는 반드시 외부 데이터의 구체적 내용을 인용\n"
+            "- PubMed 논문 제목, 웹 검색 snippet 등을 직접 언급\n"
+            "- 추측하지 말 것. 외부 데이터에 없는 내용은 '확인 불가'로 처리\n"
+            "- JSON 배열만 출력 (마크다운 코드블록 불필요)"
+        )
+
+        if feedback:
+            system += (
+                "\n\n## 사용자 피드백 (검증 시 반드시 참고)\n"
+                f"{feedback}"
+            )
+
+        payload = []
+        for r in researchers_with_verification:
+            v = r.get("verification", {})
+            payload.append({
+                "researcher": r.get("name", ""),
+                "institution": r.get("institution", ""),
+                "evidence": r.get("evidence", r.get("reason", "")),
+                "web_results": v.get("web_results", [])[:3],
+                "pub_topics": v.get("pub_topics", [])[:5],
+                "trial_titles": v.get("trial_titles", [])[:3],
+            })
+
+        prompt = (
+            f"아래 {len(payload)}명의 연구자에 대해 AI 근거와 외부 검증 데이터를 비교 분석해줘.\n\n"
             f"```json\n{json.dumps(payload, ensure_ascii=False)}\n```"
         )
         return self._call(system, prompt, max_tokens=32768)

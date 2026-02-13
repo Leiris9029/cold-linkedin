@@ -55,22 +55,15 @@ Apollo.io API에서 검색한 prospect 후보 데이터를 분석하여:
 | 이메일 가용성 | 0~1.5 | verified(1.5), high(1), medium(0.5), low(0.25), none(0) |
 | 업계 활동 | 0~1.5 | 활발한 임상시험/논문 활동(1.5), 일부(0.75), 없음/데이터없음(0) |
 
-**fit_reason에는 점수 근거를 한 줄로 기록** (예: "VP-level BD, verified email, exact department match")
-
-### 3단계: 회사 맥락 추가
-
-- fit_reason에 구체적 맥락 추가 (CSV 데이터 + 웹 리서치 결과 활용)
-
 ## 출력 형식
 
 반드시 아래 형식의 CSV 블록으로 출력:
 
 ```csv
-contact_name,email,email_confidence,company,title,linkedin_url,fit_score,fit_reason,location,source
+contact_name,email,email_confidence,company,title,linkedin_url,location,source
 ```
 
 **규칙:**
-- fit_score 내림차순 정렬
 - 이메일이 없고 추론도 불가한 경우 email 컬럼 빈칸, email_confidence는 "unknown"
 - CSV 필드에 쉼표가 포함된 경우 큰따옴표로 감싸기
 - 중복 제거: 동일 이메일+회사 조합은 1건만 유지
@@ -78,7 +71,5 @@ contact_name,email,email_confidence,company,title,linkedin_url,fit_score,fit_rea
 ## 품질 체크리스트
 
 - [ ] 추론한 이메일에 반드시 confidence 수준 표시
-- [ ] fit_score는 1~10 범위의 소수점 1자리
-- [ ] fit_reason은 영문 한 줄 (30단어 이내)
 - [ ] 중복 제거 완료 (이메일 기준)
 - [ ] 이메일 없는 prospect도 누락 없이 포함 (email 빈칸)

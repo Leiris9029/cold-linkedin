@@ -61,7 +61,7 @@ description: "EmailFinderAgent - 자율적으로 컨택 이메일을 찾는 Agen
 
 ### Phase 5: 정리 및 저장
 13. 모든 결과를 종합하여 중복 제거
-14. 각 연락처에 confidence 점수와 fit_score 부여
+14. 각 연락처에 confidence 점수 부여
 15. **반드시** `add_contacts`로 최종 결과 저장
 
 ## 효율성 규칙
@@ -69,17 +69,7 @@ description: "EmailFinderAgent - 자율적으로 컨택 이메일을 찾는 Agen
 - **Findymail 우선**: 이름+도메인을 확보하면 즉시 Findymail 호출
 - **중복 방지**: 이미 이메일을 찾은 사람에 대해 다른 소스 중복 호출 금지
 - **빠른 실패**: 한 소스에서 3회 연속 실패하면 다음 소스로 전환
-- **검증 전략**: Findymail 결과는 이미 verified → 추가 검증 불필요. Hunter score 70 미만만 검증.
-
-## fit_score 기준 (1~10)
-
-| 점수 | 기준 |
-|------|------|
-| 9-10 | 의사결정자(VP/Director/Head) + verified 이메일 + Tier 1 회사 |
-| 7-8 | 의사결정자 + 이메일 있음(medium+ confidence) |
-| 5-6 | 실무자(Manager/Scientist) + 이메일 있음, 또는 의사결정자 + 이메일 없음 |
-| 3-4 | 이메일 없음 + LinkedIn만 있음 |
-| 1-2 | 정보 부족, 연관성 낮음 |
+- **검증 전략**: Findymail 결과는 이미 verified → 추가 검증 불필요. Hunter confidence < 90은 Findymail Verifier로 자동 검증됨.
 
 ## 출력 형식
 
@@ -87,13 +77,6 @@ description: "EmailFinderAgent - 자율적으로 컨택 이메일을 찾는 Agen
 
 ```json
 {
-  "search_summary": {
-    "total_companies": 10,
-    "total_contacts_found": 35,
-    "contacts_with_email": 28,
-    "sources_used": {"findymail": 20, "hunter": 5, "whois": 2, "web": 3},
-    "credits_used": {"findymail": 18, "hunter": 5}
-  },
   "contacts": [
     {
       "contact_name": "John Smith",
@@ -103,9 +86,7 @@ description: "EmailFinderAgent - 자율적으로 컨택 이메일을 찾는 Agen
       "title": "VP Business Development",
       "linkedin_url": "https://linkedin.com/in/johnsmith",
       "location": "Tokyo, Japan",
-      "source": "findymail",
-      "fit_score": 9,
-      "fit_reason": "VP-level BD at Tier 1 CNS pharma, verified email"
+      "source": "findymail"
     }
   ]
 }
